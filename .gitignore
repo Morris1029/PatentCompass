@@ -1,0 +1,9 @@
+# PatentCompass local configuration and runtime artifacts.
+api/.env
+api/.venv/
+api/**/__pycache__/
+api/.pytest_cache/
+api/.ruff_cache/
+api/chart-renderer/node_modules/
+storage/
+*.pyc

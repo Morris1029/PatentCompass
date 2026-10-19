@@ -1,0 +1,65 @@
+name: patentcompass-dev
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg17@sha256:dd467f03ca5c5581222490e5217e48a262864ccb659be559f8491bbafdc97da0
+    environment:
+      POSTGRES_USER: patentcompass
+      POSTGRES_PASSWORD: patentcompass_dev
+      POSTGRES_DB: patentcompass
+    ports:
+      - "127.0.0.1:15432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U patentcompass -d patentcompass"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  redis:
+    image: redis:7@sha256:c6eabf748fc7a61dbb5a705c78bcf3d6377b1127a97d0ce965c11c44ba46896f
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "127.0.0.1:16379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  worker:
+    image: patentcompass-worker:dev
+    build:
+      context: ..
+      dockerfile: deploy/worker.Dockerfile
+    working_dir: /workspace/api
+    env_file:
+      - path: ../api/.env
+        required: false
+    environment:
+      DATABASE_URL: postgresql+psycopg://patentcompass:patentcompass_dev@postgres:5432/patentcompass
+      REDIS_URL: redis://redis:6379/0
+      STORAGE_ROOT: /workspace/storage
+      PYTHONUNBUFFERED: "1"
+      PYTHONPATH: /workspace/api
+    command: ["celery", "-A", "app.worker:celery_app", "worker", "--loglevel=INFO", "--concurrency=2", "--prefetch-multiplier=1"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ../api/app:/workspace/api/app:ro
+      - ../storage:/workspace/storage
+      - ../database:/workspace/database:ro
+    init: true
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+  redis_data:
