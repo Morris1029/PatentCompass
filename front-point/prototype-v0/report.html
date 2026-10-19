@@ -1,0 +1,115 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>导航报告 · 行业专利导航报告助手</title>
+  <link rel="stylesheet" href="assets/minimal.css">
+</head>
+<body>
+  <header class="site-header"><div class="header-inner"><a class="brand" href="index.html">专利导航</a><nav class="site-nav" aria-label="主导航"><a href="index.html">新建导航</a><a href="review.html">分析工作台</a><a href="report.html" aria-current="page">导航报告</a></nav><span class="preview">静态预览 · 未接入专利数据</span></div></header>
+
+  <main class="page narrow">
+    <a class="back-link" href="review.html">← 返回分析工作台</a>
+    <header class="page-title">
+      <p class="label">行业专利导航报告助手</p>
+      <h1>中国某领域专利导航报告</h1>
+      <p class="subtitle">附全球主要布局对照 · 报告结构预览</p>
+    </header>
+    <div class="scope-note">
+      <span>范围草案 v0 · 数据源待定 · 未执行检索</span>
+      <a href="scope.html">查看范围说明 →</a>
+    </div>
+
+    <section class="section" id="summary" aria-labelledby="summary-title">
+      <h2 id="summary-title">先回答企业的决策问题</h2>
+      <p>在用户选定领域中，比较可考虑的技术路线、需要关注的主体与布局地域，再将候选方向交给补检和研发验证。</p>
+      <p class="muted">当前尚无专利数据，不能给出路线优先顺序、主体排名或进入建议。正式摘要中的每项判断将关联图谱、专利记录与支持文本。</p>
+      <div class="actions">
+        <a class="btn primary" href="report-print.html">阅读完整报告结构</a>
+        <a class="small" href="#report-question">继续追问报告 →</a>
+        <button class="btn secondary" type="button" disabled>Word · 待生成</button>
+        <button class="btn secondary" type="button" disabled>PDF · 待生成</button>
+      </div>
+    </section>
+
+    <section class="section" id="chapters" aria-labelledby="analysis-title">
+      <h2 id="analysis-title">从三个问题展开分析</h2>
+      <ul class="plain-list">
+        <li>
+          <h3>路线：哪些已有方案值得比较？</h3>
+          <p>按技术问题、解决方法和应用需求梳理分支，回查代表专利。路线演进需有时间统计与文本支持。</p>
+          <a href="landscape.html#technology">查看技术路线分析结构 →</a>
+        </li>
+        <li>
+          <h3>主体：谁在哪些分支布局？</h3>
+          <p>对照主要申请人的分支布局及重点同族，定位相关记录。申请数量不直接代表技术实力。</p>
+          <a href="landscape.html#applicants">查看主体与竞争分析结构 →</a>
+        </li>
+        <li>
+          <h3>地域：重点观察哪里？</h3>
+          <p>分别查看申请人所在地、申请布局地和有据可核的有效保护地，再结合市场资料讨论目标地域。</p>
+          <a href="landscape.html#geography">查看地域布局分析结构 →</a>
+        </li>
+      </ul>
+    </section>
+
+    <section class="section" aria-labelledby="candidate-title">
+      <div class="section-head">
+        <h2 id="candidate-title">候选方向，经过补检再判断</h2>
+        <span class="status pending">设计示例</span>
+      </div>
+      <p>下面仅展示判断修正的路径，不代表已经发现任何专利或行业缺口。</p>
+      <div class="table-wrap">
+        <table class="data-table">
+          <thead><tr><th scope="col">阶段</th><th scope="col">候选方向 A 的记录方式</th></tr></thead>
+          <tbody>
+            <tr><td>初检假设</td><td>目标场景覆盖待确认，暂列为待验证线索。</td></tr>
+            <tr><td>补充检索</td><td>扩展同义词和相邻技术；示例假设补检出现相关方案线索。</td></tr>
+            <tr><td>修正判断</td><td>由可能的低覆盖方向，改为需要比较已有方案的差异化验证方向。</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="muted small">实际执行时需导入相关记录、权利要求和反例，再说明保留、修正或排除的理由。当前证据尚未导入。</p>
+      <div class="link-row">
+        <a href="opportunity.html#candidate-a">查看候选方向记录 →</a>
+        <a href="opportunity.html#supplement">查看补检路径 →</a>
+        <a href="evidence.html#records">查看证据记录位置 →</a>
+      </div>
+    </section>
+
+    <section class="section" id="follow-up" aria-labelledby="next-title">
+      <h2 id="next-title">下一步，先完成这些验证</h2>
+      <ol class="plain-list" id="pending">
+        <li><h3>确认范围与数据通道</h3><p>确定领域边界、时间、专利类型和全球对照范围，核实数据覆盖、授权及取得方式。</p></li>
+        <li><h3>对候选方向做针对性补检</h3><p>补充同义表达、分类号和相邻技术，结合全文检查已有方案与反例。</p></li>
+        <li><h3>补充研发与市场验证</h3><p>明确需要解决的技术差异、可行性验证与应用需求，再讨论立项或地域布局。</p></li>
+      </ol>
+    </section>
+
+    <section class="section" aria-labelledby="question-title">
+      <h2 id="question-title">围绕报告继续追问</h2>
+      <form class="question-box" action="question.html#candidate-question" method="get">
+        <div class="field"><label for="report-question">你的问题</label>
+        <textarea id="report-question" name="question" rows="3">为什么候选方向 A 在补检后需要修正判断？</textarea></div>
+        <div class="actions">
+          <button class="btn primary" type="submit">查看追问与局部更新示例</button>
+          <a href="question.html#region-question">申请人主要集中在哪些地域？</a>
+        </div>
+        <p class="small muted">此入口只展示本地页面跳转。实际回答需使用同一报告版本的依据；超出范围时补检并形成新版本。</p>
+      </form>
+    </section>
+
+    <section class="section" id="scope" aria-labelledby="scope-title">
+      <h2 id="scope-title">报告范围与依据</h2>
+      <p>中国专题分析包含中国和外国申请人；全球对照仅覆盖实际取得的数据。申请人所在地与申请地域分开统计，近期趋势注明公开滞后，缺失字段保留为待核实。</p>
+      <div class="link-row">
+        <a href="scope.html">范围草案 v0 →</a>
+        <a href="evidence.html#dataset">数据快照与统计口径 →</a>
+      </div>
+    </section>
+    
+  </main>
+<footer class="footer">当前为静态报告结构预览。数据源待定，未执行专利检索或分析。</footer>
+</body>
+</html>

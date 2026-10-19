@@ -1,0 +1,183 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>专利导航 · 研究工作台</title>
+  <link rel="stylesheet" href="assets/minimal.css">
+  <script defer src="assets/workspace-state.js"></script>
+  <script defer src="assets/chart-gallery.js"></script>
+  <script defer src="assets/decision-insights.js"></script>
+  <script defer src="assets/report-versions.js"></script>
+  <script defer src="assets/scope-parser.js"></script>
+  <script defer src="assets/ui.js"></script>
+  <script defer src="assets/chart-editor.js"></script>
+</head>
+<body class="draft ai-home workspace-shell workspace-view-chat">
+  <aside class="workspace-sidebar" aria-label="工作台导航">
+    <div class="sidebar-head">
+      <a class="sidebar-brand" href="index.html"><span class="sidebar-brand-mark" aria-hidden="true">导</span><strong>专利导航</strong></a>
+      <button class="sidebar-collapse" type="button" data-sidebar-collapse aria-label="收起侧栏" aria-controls="workspace-navigation" aria-expanded="true"><span aria-hidden="true">▥</span></button>
+    </div>
+    <nav id="workspace-navigation" class="sidebar-nav" aria-label="项目导航">
+      <button class="sidebar-link sidebar-new" type="button" data-new-project><span class="sidebar-icon" aria-hidden="true">＋</span><span class="sidebar-text">新建项目</span></button>
+      <span class="sidebar-caption">项目</span>
+      <div class="research-list" data-project-list><p class="research-list-empty">还没有项目</p></div>
+    </nav>
+    <div class="sidebar-foot">行业专利导航助手</div>
+  </aside>
+  <main class="workspace-main">
+    <div class="workspace-topline conversation-context" data-context hidden></div>
+    <div class="notice" data-workspace-notice hidden role="status"></div>
+    <section class="home-workbench" data-view-panel="chat" aria-label="研究对话">
+      <section class="agent-welcome" aria-labelledby="welcome-title">
+        <span class="welcome-mark" aria-hidden="true">✦</span><h1 id="welcome-title">从一个产业问题开始</h1>
+        <p>描述研究目标，逐步完善项目底稿与导航报告。</p>
+      </section>
+      <section class="agent-dialogue" aria-label="对话记录" hidden>
+        <div class="conversation-thread" data-chat-history aria-live="polite"></div>
+        <div class="conversation-message assistant" data-chat-response>
+          <span class="assistant-avatar" aria-hidden="true">导</span>
+          <div class="assistant-content"><p class="agent-answer-lead" data-extraction-note></p><div data-chat-scope></div></div>
+        </div>
+      </section>
+      <form class="agent-composer" data-chat-form>
+        <div class="composer-quote" data-composer-reference hidden></div>
+        <div class="composer-attachments" data-pending-attachments aria-live="polite"></div>
+        <label class="visually-hidden" for="chat-message">描述你的研究问题</label>
+        <textarea id="chat-message" name="message" rows="3" placeholder="描述研究问题，或提出对报告的修改要求"></textarea>
+        <div class="agent-composer-actions"><div class="composer-tools"><button class="composer-attach" type="button" data-attach-file aria-label="添加 Word 文档" title="添加 Word 文档"><svg viewBox="0 0 24 24" width="21" height="21" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><path d="m8 13 7.6-7.6a3.4 3.4 0 0 1 4.8 4.8L10.1 20.5a5.2 5.2 0 0 1-7.4-7.4L13.1 2.7M6.7 15.2l9.4-9.4" stroke-linecap="round" stroke-linejoin="round"/></svg></button><span data-composer-hint>Word 附件 · Enter 发送</span></div><button class="composer-send" type="submit"><span>发送</span><span aria-hidden="true">↑</span></button></div>
+        <input id="chat-files" type="file" accept=".doc,.docx" multiple hidden>
+        <p class="attachment-note" data-attachment-status role="status" hidden></p>
+      </form>
+    </section>
+    <section class="page wide workbench-view" data-view-panel="workbench" aria-label="分析工作台" hidden>
+      <div class="workbench-tabs" role="tablist" aria-label="工作台内容">
+        <button type="button" role="tab" id="tab-overview" aria-controls="panel-overview" data-workbench-tab="overview">概览</button>
+        <button type="button" role="tab" id="tab-analysis" aria-controls="panel-analysis" data-workbench-tab="analysis">态势分析</button>
+        <button type="button" role="tab" id="tab-layout" aria-controls="panel-layout" data-workbench-tab="layout">布局与路线图</button>
+        <button type="button" role="tab" id="tab-scope" aria-controls="panel-scope" data-workbench-tab="scope">范围与目标</button>
+        <button type="button" role="tab" id="tab-data" aria-controls="panel-data" data-workbench-tab="data">数据与证据</button>
+      </div>
+      <div class="empty-state" data-workbench-empty hidden><h2>先创建或选择一个项目</h2><p>项目建立后，在这里完善范围并管理研究资料。</p><button class="btn primary" type="button" data-new-project>新建项目</button></div>
+      <div class="workbench-panels" data-workbench-content>
+        <section class="workbench-panel" id="panel-overview" role="tabpanel" aria-labelledby="tab-overview" tabindex="0" data-workbench-panel="overview"><div data-decision-overview></div></section>
+        <section class="workbench-panel" id="panel-layout" role="tabpanel" aria-labelledby="tab-layout" tabindex="0" data-workbench-panel="layout" hidden><div data-decision-layout></div></section>
+        <section class="workbench-panel" id="panel-scope" role="tabpanel" aria-labelledby="tab-scope" tabindex="0" data-workbench-panel="scope"><div data-workbench-scope></div></section>
+        <section class="workbench-panel" id="panel-data" role="tabpanel" aria-labelledby="tab-data" tabindex="0" data-workbench-panel="data" hidden>
+          <section class="analysis-surface project-materials"><div class="section-head"><div><h2>项目资料</h2><p class="small muted">从对话添加的 Word 附件</p></div><button class="btn secondary" type="button" data-open-chat>在对话中添加</button></div><div data-project-materials></div></section>
+<section class="analysis-surface" id="data-dataset">
+      <div class="section-head"><h2>专题数据集</h2><span class="status-chip">尚未建立</span></div>
+      <div class="empty-state compact"><h3>暂无专利数据</h3><p>先确认行业、地域、日期及专利类型，再获取可复核的数据快照。统计结果将在数据完整性核查后显示。</p><div class="empty-actions"><a class="btn secondary" href="index.html#scope">查看研究范围</a></div></div>
+      <div class="table-wrap"><table class="data-table"><thead><tr><th scope="col">数据检查项</th><th scope="col">中国专题</th><th scope="col">全球对照</th></tr></thead><tbody><tr><th scope="row">来源与覆盖</th><td>待确定</td><td>待确定</td></tr><tr><th scope="row">检索结果与实际取得</th><td>待获取</td><td>待获取</td></tr><tr><th scope="row">清洗、去重与缺失字段</th><td>待核查</td><td>待核查</td></tr><tr><th scope="row">取得日期与数据版本</th><td>待建立</td><td>待建立</td></tr></tbody></table></div>
+      <details class="compact-details"><summary>统计与地域口径</summary><div class="detail-body"><ul class="plain-list"><li><strong>计数与日期</strong><span class="small muted">明确按公开文献、申请或同族计数，以及使用申请日或公开日。</span></li><li><strong>申请人归一</strong><span class="small muted">保留名称合并规则和歧义记录。</span></li><li><strong>地域与法律状态</strong><span class="small muted">分别记录申请人所在地、申请布局地和有核验依据的有效保护地；缺失值不记为零。</span></li></ul></div></details>
+    </section>
+
+    <section class="analysis-surface" id="data-records">
+      <div class="section-head"><h2>代表专利与原文</h2><span class="status-chip">待导入</span></div>
+      <div class="empty-state compact" id="data-record-a"><h3>暂无专利记录</h3><p>记录取得后，可查看公开号、申请人、时间、分类、原文、同族及法律事件的来源。</p></div>
+      <div class="split"><section class="section" id="data-support"><h3>支持依据</h3><p class="small muted">关键判断需关联相关专利、文本位置及产业资料。</p></section><section class="section" id="data-counterexample"><h3>反例依据</h3><p class="small muted">相近方案需要核对权利要求、适用场景和差异说明。</p></section></div>
+    </section>
+
+    <section class="analysis-surface" id="data-search-method">
+      <div class="section-head"><h2>检索与补检记录</h2><span class="status-chip">待开始</span></div>
+      <ul class="plain-list"><li><strong>检索范围</strong><span class="small muted">关键词、同义表达、核实的分类号、地域、日期、类型及排除条件。</span></li><li><strong>取得情况</strong><span class="small muted">返回总数、实际取得、分页完整性、失败和截断情况。</span></li><li><strong>补充检索</strong><span class="small muted">记录扩词、相邻技术、新增结果、支持证据、反例与判断变化。</span></li></ul>
+    </section>
+
+    <section class="section" id="data-limitations"><h2>证据完整性</h2><p class="muted">数据源、代表专利原文、法律事件与可靠地域字段尚待取得。资料不足时，相关趋势、排名和候选判断保持待分析状态。</p><div class="actions"><a class="btn secondary" href="index.html#scope">返回研究范围</a><a class="btn primary" href="report.html">查看报告目录 →</a></div></section>
+        </section>
+        <section class="workbench-panel" id="panel-analysis" role="tabpanel" aria-labelledby="tab-analysis" tabindex="0" data-workbench-panel="analysis" hidden>
+          <nav class="workbench-analysis-tabs workspace-nav" aria-label="分析视角"><a href="review.html" data-analysis-tab="technology">技术发展</a><a href="landscape.html" data-analysis-tab="branches">技术分支</a><a href="competition.html" data-analysis-tab="competition">竞争主体</a><a href="geography.html" data-analysis-tab="geography">地域布局</a><a href="opportunity.html" data-analysis-tab="opportunity">候选方向</a></nav>
+<section data-analysis-panel="technology" hidden>
+<section class="analysis-surface" id="technology-technology">
+      <div class="analysis-heading"><div><h2>技术分析</h2><span class="label">技术分类与年度活动</span></div><div class="chart-toolbar"><button class="btn secondary" type="button" data-chart-editor data-chart-title="技术分析图">AI 编辑</button><a href="landscape.html#methods">分支分析 →</a><a href="index.html#scope">查看分类范围 →</a></div></div>
+      <div class="chart-stage" role="group" aria-label="图表展示方式">
+        <input class="visually-hidden selector-input" type="radio" id="technology-mode-tree" name="chart-mode" checked><label for="technology-mode-tree">技术分类</label>
+        <input class="visually-hidden selector-input" type="radio" id="technology-mode-trend" name="chart-mode"><label for="technology-mode-trend">年度活动</label>
+        <figure class="chart-plot plot-tree"><div class="empty-state"><span class="empty-mark" aria-hidden="true"></span><h3>技术分类尚未生成</h3><p>确认行业边界并取得专利数据后，可在此查看技术分支及对应的代表专利。</p><div class="empty-actions"><a class="btn secondary" href="index.html#scope">查看研究范围</a><a href="evidence.html#dataset">数据准备要求 →</a></div></div></figure>
+        <figure class="chart-plot plot-trend"><div class="empty-state"><span class="empty-mark" aria-hidden="true"></span><h3>暂无年度活动数据</h3><p>取得完整数据并确认申请日、统计单位后，展示各分支的年度变化。</p><div class="empty-actions"><a class="btn secondary" href="index.html#scope">确认时间范围</a><a href="evidence.html#dataset">查看统计口径 →</a></div></div></figure>
+      </div>
+      <section class="records-section" id="technology-records"><div class="section-head"><h2>相关专利</h2><a class="small" href="evidence.html#records">数据与依据 →</a></div><div class="empty-state compact"><h3>暂无专利记录</h3><p>数据获取与分类完成后，可按技术分支核对代表方案和原文。</p></div></section>
+      <details class="compact-details"><summary>分析口径</summary><div class="detail-body"><p>趋势以约定范围内取得的数据集计算；具体技术判断需要核对专利文本。近期年度应说明公开滞后，缺失数据不记为零。</p><div class="link-row"><a href="evidence.html#dataset">数据快照与清洗规则 →</a><a href="evidence.html#search-method">检索范围与取得情况 →</a></div></div></details>
+    </section>
+    <div class="link-row"><a href="competition.html">查看竞争主体 →</a><a href="geography.html">查看地域布局 →</a></div>
+</section>
+<section data-analysis-panel="branches" hidden>
+<nav class="view-tabs" aria-label="技术分支"><a href="landscape.html#elements">基础要素与关键技术</a><a href="landscape.html#methods">核心工艺与实现方法</a><a href="landscape.html#applications">应用场景与系统集成</a></nav>
+
+    <div class="branch-views" id="branches-technology">
+      <section class="branch-panel" id="branches-elements"><div class="analysis-surface"><div class="analysis-heading"><div><h2>基础要素与关键技术</h2><span class="label">性能要求、关键要素与技术取舍</span></div><span class="status-chip">待分析</span></div><div class="chart-plot"><div class="empty-state"><span class="empty-mark" aria-hidden="true"></span><h3>暂无分支分析结果</h3><p>完成技术分类和专利文本整理后，可比较基础要素及其适用条件。</p><div class="empty-actions"><a class="btn secondary" href="index.html#scope">查看研究范围</a><a href="evidence.html#records">查看证据要求 →</a></div></div></div></div></section>
+      <section class="branch-panel default-branch" id="branches-methods"><div class="analysis-surface"><div class="analysis-heading"><div><h2>核心工艺与实现方法</h2><span class="label">技术问题、关键步骤与作用机制</span></div><span class="status-chip">待分析</span></div><div class="chart-plot"><div class="empty-state"><span class="empty-mark" aria-hidden="true"></span><h3>暂无分支分析结果</h3><p>取得相关专利并核对原文后，可比较已有方法和需要进一步验证的技术差异。</p><div class="empty-actions"><a class="btn secondary" href="index.html#scope">查看研究范围</a><a href="evidence.html#records">查看证据要求 →</a></div></div></div></div></section>
+      <section class="branch-panel" id="branches-applications"><div class="analysis-surface"><div class="analysis-heading"><div><h2>应用场景与系统集成</h2><span class="label">目标需求、技术组合与使用条件</span></div><span class="status-chip">待分析</span></div><div class="chart-plot"><div class="empty-state"><span class="empty-mark" aria-hidden="true"></span><h3>暂无分支分析结果</h3><p>明确目标应用并取得相关专利后，可核对技术组合与场景需求的对应关系。</p><div class="empty-actions"><a class="btn secondary" href="index.html#scope">查看研究范围</a><a href="evidence.html#records">查看证据要求 →</a></div></div></div></div></section>
+    </div>
+
+    <section class="analysis-surface" id="branches-records"><div class="section-head"><h2>相关专利</h2><a class="small" href="evidence.html#records">数据与依据 →</a></div><div class="empty-state compact"><h3>暂无专利记录</h3><p>专利归入分支后，可在此查看著录信息、关键文本和来源。</p></div><details class="compact-details" id="branches-coverage"><summary>分支范围与证据要求</summary><div class="detail-body"><p>技术分类需要抽样复核；摘要可辅助初步归类，具体保护范围需要结合权利要求和原文判断。</p><a href="evidence.html#dataset">查看数据快照 →</a></div></details></section>
+    <div class="link-row"><a id="branches-applicants" href="competition.html">比较主体布局 →</a><a id="branches-geography" href="geography.html">查看地域布局 →</a><a href="opportunity.html">查看候选方向 →</a></div>
+</section>
+<section data-analysis-panel="competition" hidden>
+<section class="analysis-surface" id="competition-applicants">
+      <div class="analysis-heading"><div><h2>申请人 × 技术分支</h2><span class="label">主体布局矩阵</span></div><div class="chart-toolbar"><button class="btn secondary" type="button" data-chart-editor data-chart-title="主体布局矩阵">AI 编辑</button><a class="small" href="evidence.html#dataset">查看数据口径 →</a></div></div>
+      <figure class="chart-plot"><div class="empty-state"><span class="empty-mark" aria-hidden="true"></span><h3>暂无申请人布局数据</h3><p>取得专利记录并完成申请人名称归一后，可比较主体在各技术分支的布局。</p><div class="empty-actions"><a class="btn secondary" href="index.html#scope">查看研究范围</a><a href="evidence.html#dataset">数据准备要求 →</a></div></div></figure>
+      <section class="records-section" id="competition-records"><div class="section-head"><h2>相关专利</h2><a class="small" href="evidence.html#records">数据与依据 →</a></div><div class="empty-state compact"><h3>暂无专利记录</h3><p>主体与技术分支关联后，可从矩阵下钻至对应专利清单。</p></div></section>
+      <details class="compact-details"><summary>主体分析口径</summary><div class="detail-body"><p>中国专题包含中外申请人；同名或相近名称需核实后归并。专利数量反映布局活动，不直接代表技术实力。共同申请与引用关系需要对应字段及来源支持。</p><a href="evidence.html#dataset">查看名称归一与计数规则 →</a></div></details>
+    </section>
+    <div class="link-row"><a href="geography.html">进一步看地域布局 →</a><a href="opportunity.html">查看候选方向 →</a></div>
+</section>
+<section data-analysis-panel="geography" hidden>
+<section class="analysis-surface" id="geography-geography">
+      <div class="analysis-heading"><div><h2>地域分析</h2><span class="label">按不同地域口径分别查看</span></div><div class="chart-toolbar"><button class="btn secondary" type="button" data-chart-editor data-chart-title="地域布局图">AI 编辑</button><a class="small" href="evidence.html#dataset">查看地域字段 →</a></div></div>
+      <div class="geo-selector" role="group" aria-label="地域分析口径">
+        <input class="visually-hidden selector-input" type="radio" id="geography-geo-origin" name="geography-view" checked><label for="geography-geo-origin">申请人所在地</label>
+        <input class="visually-hidden selector-input" type="radio" id="geography-geo-filing" name="geography-view"><label for="geography-geo-filing">申请布局地</label>
+        <input class="visually-hidden selector-input" type="radio" id="geography-geo-protection" name="geography-view"><label for="geography-geo-protection">有效保护地</label>
+
+        <figure class="chart-plot geo-panel geo-origin"><div class="geography-map"><div class="empty-state"><span class="empty-mark" aria-hidden="true"></span><h3>暂无申请人地域数据</h3><p>需要可靠的申请人地址，才能统计主体的省市分布。</p></div><div class="geo-explanation"><h3>申请人所在地</h3><p>保留未定位和歧义地址，不把公开号所属法域视为申请人国籍。</p><div class="link-row"><a href="evidence.html#dataset">地址字段与计数规则 →</a></div></div></div></figure>
+        <figure class="chart-plot geo-panel geo-filing"><div class="geography-map"><div class="empty-state"><span class="empty-mark" aria-hidden="true"></span><h3>暂无申请布局数据</h3><p>取得申请机构及同族成员后，可查看目标技术在哪些法域申请。</p></div><div class="geo-explanation"><h3>申请布局地</h3><p>全球对照按实际覆盖呈现；WO 为国际申请路径，EP 为区域申请机构。</p><div class="link-row"><a href="geography.html#overseas">中国申请人的海外布局 →</a></div></div></div></figure>
+        <figure class="chart-plot geo-panel geo-protection"><div class="geography-map"><div class="empty-state"><span class="empty-mark" aria-hidden="true"></span><h3>暂无有效保护地数据</h3><p>需要法律事件、来源和核验日期，才能展示有效保护地域。</p></div><div class="geo-explanation"><h3>有效保护地</h3><p>缺少法律状态时保留未知，不从申请或公开活动推断有效权利。</p><div class="link-row"><a href="evidence.html#dataset">法律状态口径 →</a></div></div></div></figure>
+      </div>
+      <section class="records-section" id="geography-records"><div class="section-head"><h2>相关专利</h2><a class="small" href="evidence.html#records">数据与依据 →</a></div><div class="empty-state compact"><h3>暂无专利记录</h3><p>选择地域后，可核对对应的主体、同族及法律状态记录。</p></div></section>
+      <details class="compact-details" id="geography-overseas"><summary>中国申请人的海外布局</summary><div class="detail-body"><p>先依据可靠地域信息识别中国申请人，再通过同族成员观察海外申请。跨法域布局分别保留，不将 WO、EP 直接当作有效保护国家。</p><a href="evidence.html#dataset">查看来源与同族规则 →</a></div></details>
+    </section>
+    <div class="link-row"><a href="competition.html">返回主体布局 →</a><a href="report.html#geography">查看报告章节 →</a></div>
+</section>
+<section data-analysis-panel="opportunity" hidden>
+<div id="opportunity-candidate-a" data-decision-opportunities></div>
+
+    <section class="analysis-surface" id="opportunity-supplement">
+      <div class="section-head"><h2>验证流程</h2><span class="status-chip">待开始</span></div>
+      <div class="workflow-steps"><div class="workflow-step"><span>01</span><strong>识别线索</strong><small>对照技术问题、解决方法与目标场景</small></div><div class="workflow-step"><span>02</span><strong>补充检索</strong><small>扩展同义表达、分类号和相邻技术</small></div><div class="workflow-step"><span>03</span><strong>复核判断</strong><small>核对原文、支持依据与可能反例</small></div></div>
+      <div class="split">
+        <section class="section" id="opportunity-support"><h3>支持依据</h3><p class="small muted">相关专利和产业资料进入数据集后，可在此核对线索所依据的目标需求与已有方法。</p><a class="small" href="evidence.html#support">查看证据要求 →</a></section>
+        <section class="section" id="opportunity-counterexample"><h3>反例核查</h3><p class="small muted">补检得到的相近方案需结合原文和权利要求比较，避免把检索遗漏误认为技术空白。</p><a class="small" href="evidence.html#counterexample">查看反例要求 →</a></section>
+      </div>
+      <details class="compact-details"><summary>判断规则</summary><div class="detail-body"><p>若补检发现相关方案，需重新比较技术差异；若结果取得不完整，保留待验证状态。未检出相关专利不等于不存在专利，也不构成自由实施判断。</p></div></details>
+    </section>
+
+    <section class="section" id="opportunity-next-steps"><div class="section-head"><h2>下一步</h2></div><div class="actions"><a class="btn primary" href="index.html#scope">完善研究范围 →</a><a class="btn secondary" href="evidence.html#dataset">查看数据准备要求</a></div></section>
+</section>
+        </section>
+      </div>
+    </section>
+    <section class="page wide report-workspace" data-view-panel="report" hidden><div data-report-container></div></section>
+  </main>
+  <template id="scope-template"><section class="scope-summary scope-review" data-scope-section aria-labelledby="scope-title">
+              <div class="section-head"><div><span class="label">项目底稿</span><h2 id="scope-title">研究范围</h2></div><button class="btn secondary" type="button" data-scope-edit>修改</button></div>
+              <p class="scope-review-note">项目内所有对话共用此范围，可直接在表中修改。</p>
+              <form class="scope-edit-form" action="index.html#scope" method="get" data-scope-form>
+                <div class="table-wrap"><table class="data-table scope-table"><tbody>
+                  <tr><th scope="row">目标行业</th><td><span class="scope-value" data-industry>待确认</span><div class="scope-editor"><label class="visually-hidden" for="scope-industry">目标行业</label><input id="scope-industry" name="industry" type="text"></div></td></tr>
+                  <tr><th scope="row">决策目标</th><td><span class="scope-value" data-goal>待确认</span><div class="scope-editor"><label class="visually-hidden" for="scope-goal">决策目标</label><select id="scope-goal" name="goal"><option value="">请选择</option><option value="entry">进入新行业</option><option value="rd">研发立项</option><option value="direction">选择技术方向</option></select></div></td></tr>
+                  <tr><th scope="row">应用需求</th><td><span class="scope-value" data-need>待确认</span><div class="scope-editor"><label class="visually-hidden" for="scope-need">应用需求</label><textarea id="scope-need" name="need" rows="2"></textarea></div></td></tr>
+                  <tr><th scope="row">关注对象 / 排除条件</th><td><span class="scope-value" data-focus>待确认</span><div class="scope-editor"><label class="visually-hidden" for="scope-focus">关注对象或排除条件</label><input id="scope-focus" name="focus" type="text"></div></td></tr>
+                  <tr><th scope="row">中国专题</th><td>相关技术在中国的申请活动，包含中外申请人</td></tr>
+                  <tr><th scope="row">全球对照</th><td>同一技术边界，按实际数据覆盖比较</td></tr>
+                  <tr><th scope="row">时间范围</th><td><span class="scope-value" data-years>待确认</span><div class="scope-editor scope-year-fields"><label for="scope-start">开始年份<input id="scope-start" name="start" type="number" min="1900" max="2100" placeholder="开始"></label><label for="scope-end">结束年份<input id="scope-end" name="end" type="number" min="1900" max="2100" placeholder="结束"></label></div></td></tr>
+                  <tr><th scope="row">专利类型</th><td><span class="scope-value" data-type>待确认</span><div class="scope-editor"><label class="visually-hidden" for="scope-type">专利类型</label><select id="scope-type" name="type"><option value="">尚未设置</option><option value="invention">发明专利</option><option value="utility">实用新型</option><option value="both">发明专利与实用新型</option></select></div></td></tr>
+                  <tr><th scope="row">统计单位</th><td>待数据源与字段覆盖确认</td></tr>
+                </tbody></table></div>
+                <div class="scope-edit-actions"><button class="btn primary" type="submit">保存范围</button><button class="btn secondary" type="button" data-scope-cancel>取消</button></div>
+              </form>
+              <div class="scope-view-actions"><a class="btn primary" href="review.html" data-analysis-link>进入分析工作台 →</a><a class="small" href="evidence.html#dataset">查看数据准备要求 →</a></div>
+            </section></template>
+</body>
+</html>
