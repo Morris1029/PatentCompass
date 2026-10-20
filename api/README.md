@@ -153,6 +153,10 @@ EMBEDDING_MODEL=...
 
 `GET /api/reports/{id}/research-versions` 分页返回已发布研究；`POST` 同路径携带 `base_revision_id`，只在同一项目创建新主对话及未编号草稿。草稿第一次成功生成报告时，才分配下一个研究编号并采用。普通聊天、分析完成、失败、取消均不占号。
 
+普通新对话在意图识别前不绑定当前研究。一次规划同时识别动作及 `research_intent`（继续、指定目标、新研究或需要选择），参考近期消息、引用及已有研究目标；年份或关键词变化本身不升级研究版本。报告任务在现有 `execution_confirmation` 中返回 `research_assignment`，用 `values.research_choice=new|existing` 与可编辑 `scope` 一起确认。生成报告的范围条件和最终目标保留在同一任务，确认后自动继续分析和报告生成，修改段落不明确时也在同卡选择。
+
+确认新研究时，未绑定会话直接成为草稿主对话；已有主对话则在同项目建立新对话并保留来源入口。规划阶段仅保存提议和冻结依据，确认后才保存归属决定；后续步骤和重试复用该决定，不随项目采用状态改投。按钮入口继续作为快捷方式，问答、仅检索或仅分析均不会因此创建研究绑定。
+
 `GET /api/research-versions/{id}` 返回研究详情及独立上下文；`POST /api/research-versions/{id}/conversation` 确保并返回固定主对话。范围、数据、分析任务可传 `research_id`，分别维护各轮研究的工作上下文。报告追问默认使用报告冻结依据，明确询问工作分析时采用该研究的工作上下文。
 
 `PUT /api/research-versions/{id}/adopt` 携带 `expected_current_version_id` 采用该研究最新内容。`POST /api/research-versions/{id}/restore` 携带 `revision_id`、所属研究的 `expected_current_version_id` 和项目的 `expected_adopted_version_id`，异步追加恢复记录并采用所属研究；其它研究和修改历史保留。旧 `current-version` 接口只用于采用研究的最新记录，历史内容须通过恢复接口操作。

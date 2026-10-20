@@ -138,6 +138,11 @@ def _prepare_plan(ctx):
         "target表示明确修改目录中的某项研究并填写target_research_id，new表示新的独立主题/新一轮研究，"
         "choose表示无法确定，应请用户选择。结合recent_messages与research_directory判断；项目当前采用项仅供参考，"
         "普通新对话不能仅因有采用报告就默认延续。明确要求新主题或重新开展一轮研究时选new。"
+        "上下文scope是工作范围参考，不等于用户本轮提供了这些参数。continue需要已绑定研究或明确引用/指定；"
+        "未绑定普通新会话只说‘重新生成一份报告’时，即使scope参考已有完整参数，也必须choose。"
+        "年份或关键词变化本身不代表新研究：已绑定主对话中的范围调整默认continue；"
+        "只有明确独立研究目标并要求完整报告，才建议new。仅说‘重新生成一份’而无明确目标时选choose。"
+        "仅analyze或检索问答不判断发布新研究，也不建立研究归属。"
         "research_reason简短解释归属判断，research_topic概括这次主题；不得编造目录外的研究ID。"
         "用户要求完整研究/分析并最终生成报告时，action必须generate_report；scope_changes仅描述新范围，"
         "不能把这类请求降为scope或仅analyze。只有明确单独修改范围、不要求报告时才用scope。"
@@ -162,17 +167,30 @@ def _prepare_plan(ctx):
                                        if block.get("chart_id") and block.get("chart_version_id")})
             if plan["chart_id"] in chart_versions:
                 pin["chart_plan_version_id"] = chart_versions[plan["chart_id"]]
-        answer_basis = None
-        if research and plan["action"] == "chat":
-            if version and (message.reference or plan["answer_context"] == "report"):
-                answer_basis = {"scope_version_id": version.scope_version_id,
-                                "dataset_version_ids": list(version.dataset_version_ids)}
-                pin.update(reference_version_id=version.id, analysis_id=version.analysis_id)
-            else:
-                answer_basis = current
-                pin.update(reference_version_id=None, analysis_id=current["analysis_id"])
         with session_scope() as session:
             run = ctx.guard(session)
+            answer_basis = None
+            if plan["action"] == "chat":
+                answer_version, answer_current = version, current
+                if plan["research_intent"] == "target" and plan.get("target_research_id") and not message.reference:
+                    target = session.scalar(select(ResearchVersion).join(Report, ResearchVersion.report_id == Report.id).where(
+                        ResearchVersion.id == plan["target_research_id"], Report.project_id == ctx.project_id))
+                    if not target:
+                        raise AppError(422, "RESEARCH_TARGET_INVALID", "计划中的研究目标不属于此项目，请重新核对")
+                    from app.research_service import context_for
+                    answer_current = context_for(session, target)
+                    answer_id = target.current_revision_id or target.base_revision_id
+                    answer_version = session.get(ReportVersion, answer_id) if answer_id else None
+                    pin.update(plan_report_version_id=answer_id, plan_report_current_id=target.current_revision_id)
+                if answer_version and (message.reference or plan["answer_context"] == "report"):
+                    answer_basis = {"scope_version_id": answer_version.scope_version_id,
+                                    "dataset_version_ids": list(answer_version.dataset_version_ids)}
+                    pin.update(reference_version_id=answer_version.id, analysis_id=answer_version.analysis_id)
+                else:
+                    answer_basis = answer_current or {"scope_version_id": ctx.scope_version_id,
+                        "dataset_version_ids": list(ctx.dataset_version_ids),
+                        "analysis_id": ctx.payload.get("analysis_id") or pin.get("analysis_id")}
+                    pin.update(reference_version_id=None, analysis_id=answer_basis.get("analysis_id"))
             run.payload = {**run.payload, "plan": plan, **pin}
             proposal = prepare_assignment(session, run, plan)
             if proposal:
@@ -225,7 +243,9 @@ def execute(ctx):
     validate_scope(dict(plan["scope_changes"]))
     action = plan["action"]
     if action in REPORT_ACTIONS and not ctx.payload.get("research_decision"):
-        require_execution(ctx, [action])
+        actions = ["analyze", "generate_report"] if action == "generate_report" and (
+            plan["scope_changes"] or not ctx.payload.get("analysis_id") or plan.get("semantic_mode") == "full") else [action]
+        require_execution(ctx, actions)
     if plan["scope_changes"] and action not in REPORT_ACTIONS and not ctx.payload.get("plan_confirmed"):
         wait_for_input(ctx, "plan_confirmation", "识别到统计范围变更，请确认后重新计算", changes=plan["scope_changes"],
                        scope_version_id=ctx.scope_version_id, plan=plan)

@@ -163,6 +163,8 @@ def _heartbeat(run_id, token, stopped):
 def _confirm_scope(ctx):
     if ctx.kind not in {"analyze", "generate_report", "index"}:
         return
+    if ctx.kind == "generate_report" and ctx.conversation_id and ctx.payload.get("message_id"):
+        return
     with session_scope() as session:
         run = ctx.guard(session)
         scope = session.get(ScopeVersion, ctx.scope_version_id)

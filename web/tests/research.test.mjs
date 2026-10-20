@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { researchLabel, revisionLabel, reportComparisonLabel, withResearchContext, researchAssignmentChoice, orderReportComparison } from "../src/lib/research.ts";
+import { researchLabel, revisionLabel, reportComparisonLabel, withResearchContext, researchAssignmentChoice, orderReportComparison, requiresReportBlocks } from "../src/lib/research.ts";
 
 test("cross research comparison is older on the left even when browsing V1 and choosing V2", () => {
   const v1 = { id: "v1-snapshot", research_id: "r1", research_number: 1 };
@@ -40,6 +40,12 @@ test("an explicit report target stays with its research and cannot become a new 
   const assignment = { intent: "target", recommended: "existing", allow_new: false, allow_existing: true, existing_number: 1 };
   assert.equal(researchAssignmentChoice(assignment), "existing");
   assert.equal(researchAssignmentChoice(assignment, "new"), "existing");
+});
+
+test("a confirmed assignment remains fixed when updated scope requires another confirmation", () => {
+  const assignment = { intent: "choose", recommended: "new", allow_new: true, allow_existing: false, fixed: true };
+  assert.equal(researchAssignmentChoice(assignment), "new");
+  assert.equal(researchAssignmentChoice(assignment, "existing"), "new");
 });
 
 test("editing an older research uses its own scope, dataset, analysis and head without changing the adopted project", () => {
@@ -89,4 +95,15 @@ test("the same research compares modification records using their times", () => 
 test("different known research versions retain the V1 to V2 comparison", () => {
   assert.deepEqual(reportComparisonLabel({ research_id: "new", research_number: 2 }, { research_id: "old", research_number: 1 }), { title: "研究版本对比", before: "V1", after: "V2" });
   assert.equal(reportComparisonLabel({}, {}).title, "修改记录对比");
+});
+
+
+test("the combined execution card requires target blocks only when updating an existing report", () => {
+  const request = { kind: "execution_confirmation", select_blocks: true, blocks: [{ id: "block1", text: "目标段落" }] };
+  assert.equal(requiresReportBlocks(request, "existing"), true);
+  assert.equal(requiresReportBlocks(request, "new"), false);
+  assert.equal(requiresReportBlocks(request), false);
+  assert.equal(requiresReportBlocks({ ...request, select_blocks: false }, "existing"), false);
+  assert.equal(requiresReportBlocks({ kind: "report_target" }, undefined, false), true);
+  assert.equal(requiresReportBlocks({ kind: "report_target" }, undefined, true), false);
 });

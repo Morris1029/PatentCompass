@@ -210,12 +210,16 @@ def test_old_research_reference_requests_latest_own_head_without_adopting_it(
     context = _context(db_session, project, context_factory, research, payload={
         "plan": orchestration.Plan(action="revise_report", reason="改标题", operations=[{"op": "set_title", "text": "确认后标题"}]).model_dump(mode="json"),
         "plan_report_version_id": old.id, "plan_report_current_id": old.id})
+    db_session.get(Message, context.payload["message_id"]).reference = {"report_version_id": old.id}
+    db_session.flush()
     with pytest.raises(WaitingForInput):
         orchestration.execute(context)
     db_session.expire_all()
     request = db_session.get(ResearchRun, context.run_id).input_request
-    assert request["kind"] == "report_target" and request["base_version_id"] == head.id
-    assert request["title"] == "本轮最新稿"
+    assert request["kind"] == "execution_confirmation" and request["report_base_version_id"] == head.id
+    assert request["target_expected_current_version_id"] == head.id
+    assert request["research_assignment"]["existing_research_id"] == research.id
+    assert any("本轮最新稿" in detail for action in request["actions"] for detail in action["details"])
     assert [block["id"] for block in request["blocks"]] == [block["id"] for block in head.content["blocks"]]
     assert db_session.get(Report, report.id).current_version_id == adopted.id
     assert db_session.get(ResearchVersion, research.id).current_revision_id == head.id
@@ -262,6 +266,11 @@ def test_report_edit_pins_run_to_head_basis_without_resetting_working_context(
         "analysis_id": working["analysis_id"],
         "plan": orchestration.Plan(action="revise_report", reason="修改已保存报告", operations=[{"op": "set_title", "text": "修订标题"}]).model_dump(mode="json"),
         "plan_report_version_id": head.id, "plan_report_current_id": head.id})
+    research.main_conversation_id = context.conversation_id
+    context.payload = {**context.payload, "research_decision": {
+        "choice": "existing", "research_id": research.id, "conversation_id": context.conversation_id}}
+    db_session.get(ResearchRun, context.run_id).payload = dict(context.payload)
+    db_session.flush()
     observed = []
 
     def confirm(ctx, kinds):

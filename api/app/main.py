@@ -731,7 +731,9 @@ def create_app(start_dispatcher=True):
         def action():
             initial = owned(session, ResearchRun, id)
             project = owned(session, Project, initial.project_id, lock=True) if initial.project_id else None
-            candidate_id = initial.payload.get("research_id") or initial.payload.get("research_proposal", {}).get("existing_research_id")
+            proposal_id = initial.payload.get("research_proposal", {}).get("existing_research_id")
+            candidate_id = (initial.payload.get("research_id") if initial.payload.get("research_decision")
+                            else proposal_id or initial.payload.get("research_id"))
             candidate = research_for(session, project, candidate_id) if project and candidate_id else None
             research = candidate if initial.payload.get("research_id") else None
             run = owned(session, ResearchRun, id, lock=True)
@@ -756,6 +758,22 @@ def create_app(start_dispatcher=True):
                 if run.input_request.get("research_assignment"):
                     from app.research_service import confirm_assignment
                     research, destination = confirm_assignment(session, run, body.values.get("research_choice"))
+                    if run.payload["research_decision"]["choice"] == "existing" and run.input_request.get("report_base_version_id"):
+                        version = owned(session, ReportVersion, run.input_request["report_base_version_id"])
+                        expected_head = run.input_request["target_expected_current_version_id"]
+                        if version.research_id != research.id or research.current_revision_id != expected_head or version.id != expected_head:
+                            raise AppError(409, "REPORT_VERSION_CONFLICT", "目标研究的报告已变化，请重新核对")
+                        targets = body.values.get("block_ids", run.input_request.get("block_ids", []))
+                        valid_ids = {block["id"] for block in version.content["blocks"]}
+                        if not isinstance(targets, list) or any(target not in valid_ids for target in targets) or (
+                                run.input_request.get("select_blocks") and not targets):
+                            raise AppError(422, "BLOCK_TARGET_REQUIRED", "请选择目标报告内需要修改的正文块")
+                        run.payload = {**run.payload, "target_version_id": version.id,
+                                       "target_current_id": expected_head, "target_block_ids": targets}
+                    if run.payload.get("plan", {}).get("action", run.kind) == "generate_report":
+                        from app.research_service import set_context
+                        set_context(session, research, scope_id=run.scope_version_id,
+                                    dataset_ids=run.dataset_version_ids, analysis_id=run.payload.get("analysis_id"))
                 editable = scope_editable_for_run(run)
                 if submitted_scope is not None or (run.input_request.get("research_assignment") and editable):
                     existing_scope = session.get(ScopeVersion, run.scope_version_id)

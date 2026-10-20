@@ -115,13 +115,13 @@ def test_global_title_operation_can_confirm_new_version_without_body_target(clie
         "content": "修改报告标题", "action": "auto", "reference": {"report_version_id": v1.id}}}).json()
     jobs.execute_run(task["run_id"])
     waiting = client.get(f"/api/runs/{task['run_id']}").json()
-    assert waiting["input_request"]["kind"] == "report_target"
+    assert waiting["input_request"]["kind"] == "execution_confirmation"
+    assert waiting["input_request"]["report_base_version_id"] == second["report_version_id"]
+    assert waiting["input_request"]["select_blocks"] is False
     accepted = client.post(f"/api/runs/{task['run_id']}/inputs", json={"input_request_id": waiting["input_request"]["id"],
-        "values": {"confirmed": True, "base_version_id": second["report_version_id"],
-                   "expected_current_version_id": second["report_version_id"], "block_ids": []}})
+        "values": {"confirmed": True, "research_choice": "existing", "block_ids": []}})
     assert accepted.status_code == 202, accepted.text
     jobs.execute_run(task["run_id"])
-    _confirm_execution(client, task)
     completed = client.get(f"/api/runs/{task['run_id']}").json()
     assert completed["status"] == "succeeded", completed
     revised = db_session.get(ReportVersion, completed["result"]["report_version_id"])

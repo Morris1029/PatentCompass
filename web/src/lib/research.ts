@@ -10,16 +10,21 @@ export type ResearchAssignment = {
   intent: "continue" | "target" | "new" | "choose";
   reason?: string; topic?: string; recommended: ResearchChoice | null;
   existing_research_id?: string | null; existing_number?: number | null; existing_title?: string | null; existing_conversation_id?: string | null;
-  new_uses_current_conversation?: boolean; allow_new: boolean; allow_existing: boolean;
+  new_uses_current_conversation?: boolean; allow_new: boolean; allow_existing: boolean; fixed?: boolean;
 };
 
 export function researchAssignmentChoice(assignment?: ResearchAssignment, selected?: ResearchChoice): ResearchChoice | undefined {
   if (!assignment) return undefined;
   const allowed = (choice?: ResearchChoice | null) => choice === "new" ? assignment.intent !== "target" && assignment.allow_new : choice === "existing" && assignment.allow_existing;
   if (assignment.intent === "target") return assignment.allow_existing ? "existing" : undefined;
+  if (assignment.fixed) return allowed(assignment.recommended) ? assignment.recommended! : undefined;
   if (allowed(selected)) return selected;
   if (assignment.intent === "choose") return undefined;
   return allowed(assignment.recommended) ? assignment.recommended! : undefined;
+}
+
+export function requiresReportBlocks(request: Record<string, any>, choice?: ResearchChoice, plannedOperations = false): boolean {
+  return (request.kind === "report_target" && !plannedOperations) || (request.kind === "execution_confirmation" && request.select_blocks === true && choice === "existing");
 }
 
 export function researchLabel(revision: ResearchRevision): string {
