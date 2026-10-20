@@ -4,15 +4,15 @@ import hashlib
 import json
 import logging
 from contextlib import asynccontextmanager
-from datetime import date
-from typing import Annotated
+from datetime import date, datetime
+from typing import Annotated, Literal
 from uuid import UUID
 
 from fastapi import Depends, FastAPI, File, Form, Header, Query, Request, Response, UploadFile
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
-from sqlalchemy import func, select, text
+from sqlalchemy import func, select, text, tuple_
 from sqlalchemy.orm import Session
 from starlette.exceptions import HTTPException
 
@@ -24,7 +24,7 @@ from app.jobs import TERMINAL, create_run, dispatch_pending, emit_event
 from app.models import (AnalysisResult, Chart, Conversation, Dataset, DatasetVersion, Evidence,
                         IdempotencyRequest, Message, PatentApplication, PatentPublication, Project,
                         Report, ReportVersion, ResearchRun, RunEvent, RunStep, ScopeVersion, StoredFile,
-                        new_id, utcnow)
+                        ChartVersion, DatasetSource, ImportConflict, Material, MaterialBlock, new_id, utcnow)
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +43,10 @@ def record(row, exclude=()):
 
 
 def owned(session, model, object_id, lock=False):
+    try:
+        object_id = str(UUID(str(object_id)))
+    except (ValueError, TypeError, AttributeError):
+        raise AppError(422, "INVALID_RESOURCE_ID", "资源标识无效")
     query = select(model).where(model.id == str(object_id))
     if lock:
         query = query.with_for_update().execution_options(populate_existing=True)
@@ -136,6 +140,8 @@ def validate_scope(content):
                "application_start", "application_end", "source_region", "coverage"}
     if set(content) - allowed:
         raise AppError(422, "INVALID_SCOPE_FIELD", "研究范围含不支持的字段", sorted(set(content) - allowed))
+    if content.get("type") or content.get("patent_type"):
+        raise AppError(422, "PATENT_TYPE_UNAVAILABLE", "当前数据未提供可核验的专利类型字段，暂时不能按发明或实用新型筛选")
     for key in ("q", "applicant", "ipc"):
         value = content.get(key)
         if value is not None and (not isinstance(value, str) or len(value) > 1000):
@@ -187,18 +193,36 @@ def check_reference(session, project, reference):
             raise AppError(404, "BLOCK_NOT_FOUND", "引用段落不存在")
         if reference.get("text") and reference["text"] not in str(block.get("text", "")):
             raise AppError(409, "REFERENCE_TEXT_MISMATCH", "引用原文与报告版本不匹配")
+    if reference.get("block_ids"):
+        selected = [item for item in version.content.get("blocks", []) if item.get("id") in reference["block_ids"]]
+        if len(selected) != len(set(reference["block_ids"])):
+            raise AppError(404, "BLOCK_NOT_FOUND", "引用正文块不存在")
+        if reference.get("text") and " ".join(reference["text"].split()) not in " ".join(
+                " ".join(str(item.get("text", "")) for item in selected).split()):
+            raise AppError(409, "REFERENCE_TEXT_MISMATCH", "引用文字与报告快照不匹配")
 
 
 def make_message(session, project, conversation, message):
     value = message.model_dump(mode="json")
     check_reference(session, project, value.get("reference"))
+    for material_id in message.attachments:
+        material = owned(session, Material, material_id)
+        if material.project_id != project.id:
+            raise AppError(404, "MATERIAL_NOT_FOUND", "资料不属于此项目")
+        if material.status != "ready":
+            raise AppError(409, "MATERIAL_NOT_READY", "请等待附件解析完成后发送", {"material_id": material.id})
     if message.action in {"analyze", "generate_report"} and not project.dataset_version_id:
         raise AppError(409, "DATASET_REQUIRED", "请先绑定就绪的数据版本")
     row = Message(conversation_id=conversation.id, role="user", content=message.content,
-                  reference=value.get("reference"))
+                  reference=value.get("reference"), attachments=value["attachments"])
     session.add(row)
     session.flush()
-    run = create_run(session, message.action, project, {"message_id": row.id}, conversation.id)
+    run = create_run(session, message.action, project, {"message_id": row.id, "report_mode": message.report_mode,
+                     "semantic_mode": message.semantic_mode, "attachments": value["attachments"]}, conversation.id)
+    if message.action in {"chat", "auto"} and project.current_analysis_id:
+        analysis = session.get(AnalysisResult, project.current_analysis_id)
+        if analysis.scope_version_id == run.scope_version_id and analysis.dataset_version_ids == run.dataset_version_ids:
+            run.payload = {**run.payload, "analysis_id": analysis.id}
     if message.reference:
         version = session.get(ReportVersion, str(message.reference.report_version_id))
         run.scope_version_id, run.dataset_version_ids = version.scope_version_id, list(version.dataset_version_ids)
@@ -342,7 +366,8 @@ def create_app(start_dispatcher=True):
     @app.post("/api/datasets/imports", response_model=schemas.TaskResponse, status_code=202, tags=["datasets"])
     def import_dataset(request: Request, response: Response, session: DB,
                        file: UploadFile | None = File(None), source_file_id: UUID | None = Form(None),
-                       name: str = Form("无人机专利样本", min_length=1, max_length=300), source_metadata: str = Form("{}")):
+                       name: str = Form("无人机专利样本", min_length=1, max_length=300), source_metadata: str = Form("{}"),
+                       base_dataset_version_id: UUID | None = Form(None)):
         if (file is None) == (source_file_id is None):
             raise AppError(422, "IMPORT_SOURCE_REQUIRED", "上传文件和 source_file_id 必须且只能提供一项")
         try:
@@ -356,18 +381,42 @@ def create_app(start_dispatcher=True):
             raise AppError(422, "INVALID_IMPORT_FILE", "请上传不超过 20MB 的 .xlsx 文件")
         payload = {"source_file_id": str(source_file_id) if source_file_id else None,
                    "sha256": hashlib.sha256(content).hexdigest() if content is not None else None,
-                   "name": name, "source_metadata": metadata}
+                   "name": name, "source_metadata": metadata,
+                   "base_dataset_version_id": str(base_dataset_version_id) if base_dataset_version_id else None}
         def action():
             source = owned(session, StoredFile, source_file_id) if source_file_id else None
             if source and source.kind != "raw":
                 raise AppError(422, "INVALID_SOURCE_FILE", "只能从原始导入文件创建数据集")
             file_hash = source.sha256 if source else payload["sha256"]
             session.execute(text("SELECT pg_advisory_xact_lock(hashtextextended(:key, 0))"), {"key": "import:" + file_hash})
+            if base_dataset_version_id:
+                base = owned(session, DatasetVersion, base_dataset_version_id)
+                if base.status != "ready":
+                    raise AppError(409, "BASE_DATASET_NOT_READY", "合并基础版本尚未就绪")
+                fingerprint = hashlib.sha256(f"{base.id}:{file_hash}:cnipa-v1:merge-v1".encode()).hexdigest()
+                version = session.scalar(select(DatasetVersion).where(DatasetVersion.merge_fingerprint == fingerprint))
+                if version:
+                    run = session.scalar(select(ResearchRun).where(ResearchRun.kind == "merge_import",
+                        ResearchRun.payload["dataset_version_id"].astext == version.id).order_by(ResearchRun.created_at.desc()).limit(1))
+                    if run.status == "cancelled":
+                        run = create_run(session, "merge_import", payload=dict(run.payload), retry_of_id=run.id)
+                    return task_result(run, dataset_id=base.dataset_id, dataset_version_id=version.id,
+                                       source_file_id=version.source_file_id, reused=True)
+                source = source or store_bytes(session, content, file.filename, "raw")
+                version = DatasetVersion(dataset_id=base.dataset_id, source_file_id=source.id, status="pending",
+                    base_version_id=base.id, merge_fingerprint=fingerprint,
+                    source_metadata={**base.source_metadata, **metadata})
+                session.add(version)
+                session.flush()
+                run = create_run(session, "merge_import", payload={"dataset_version_id": version.id,
+                    "source_file_id": source.id, "base_dataset_version_id": base.id, "merge_fingerprint": fingerprint})
+                return task_result(run, dataset_id=base.dataset_id, dataset_version_id=version.id,
+                                   source_file_id=source.id, reused=False)
             dataset = session.scalar(select(Dataset).where(Dataset.owner_id == get_settings().dev_owner_id,
                                                           Dataset.source_sha256 == file_hash))
             if dataset:
                 version = session.scalar(select(DatasetVersion).where(DatasetVersion.dataset_id == dataset.id,
-                                                                      DatasetVersion.rule_version == "cnipa-v1"))
+                     DatasetVersion.rule_version == "cnipa-v1", DatasetVersion.base_version_id.is_(None)))
                 run = session.scalar(select(ResearchRun).where(ResearchRun.kind == "import",
                                      ResearchRun.payload["dataset_version_id"].astext == version.id)
                                      .order_by(ResearchRun.created_at.desc()).limit(1))
@@ -386,6 +435,7 @@ def create_app(start_dispatcher=True):
                                      status="pending", source_metadata=metadata)
             session.add(version)
             session.flush()
+            session.add(DatasetSource(version_id=version.id, file_id=source.id, details={"kind": "original"}))
             run = create_run(session, "import", payload={"dataset_version_id": version.id})
             return task_result(run, dataset_id=dataset.id, dataset_version_id=version.id, source_file_id=source.id, reused=False)
         return mutate(session, request, response, payload, action, 202)
@@ -397,7 +447,10 @@ def create_app(start_dispatcher=True):
         if version.dataset_id != dataset.id:
             raise AppError(404, "VERSION_NOT_FOUND", "数据版本不属于此数据集")
         return {"dataset_id": dataset.id, "dataset_version_id": version.id, "status": version.status,
-                "quality": version.quality, "source_metadata": version.source_metadata, "source_file_id": version.source_file_id}
+                "quality": version.quality, "source_metadata": version.source_metadata, "source_file_id": version.source_file_id,
+                "base_version_id": version.base_version_id,
+                "conflicts": [record(row) for row in session.scalars(select(ImportConflict).where(ImportConflict.version_id == version.id))],
+                "sources": [record(row) for row in session.scalars(select(DatasetSource).where(DatasetSource.version_id == version.id))]}
 
     @app.put("/api/projects/{id}/datasets", response_model=schemas.ProjectResponse, tags=["datasets"])
     def bind_dataset(id: UUID, body: schemas.DatasetBinding, request: Request, response: Response, session: DB):
@@ -435,17 +488,19 @@ def create_app(start_dispatcher=True):
             if analysis.project_id != project.id:
                 raise AppError(404, "ANALYSIS_NOT_FOUND", "分析不属于此项目")
         if chart_id:
+            from app.chart_service import snapshot
             chart = owned(session, Chart, chart_id)
-            if chart.project_id != project.id or (chart_version_id and str(chart_version_id) != chart.version_id):
+            if chart.project_id != project.id:
                 raise AppError(404, "CHART_NOT_FOUND", "图表或版本不属于此项目")
+            selected_chart = snapshot(session, chart, str(chart_version_id) if chart_version_id else None)
             chart_analysis = session.get(AnalysisResult, chart.analysis_id)
             if analysis and analysis.id != chart_analysis.id:
                 raise AppError(409, "SNAPSHOT_CONFLICT", "图表与指定分析版本不一致")
             analysis = chart_analysis
             if dimension_value is not None:
-                if dimension_value not in chart.selections.get("values", {}):
+                if dimension_value not in selected_chart["selections"].get("values", {}):
                     raise AppError(422, "UNKNOWN_DIMENSION_VALUE", "图表中不存在此维度值")
-                filters["application_ids"] = chart.selections["values"][dimension_value]
+                filters["application_ids"] = selected_chart["selections"]["values"][dimension_value]
         if analysis:
             filters.update(scope_version_id=analysis.scope_version_id, dataset_version_ids=analysis.dataset_version_ids)
             if "application_ids" not in filters:
@@ -478,7 +533,7 @@ def create_app(start_dispatcher=True):
     def new_conversation(id: UUID, body: schemas.ConversationCreate, request: Request, response: Response, session: DB):
         def action():
             project = owned(session, Project, id)
-            conversation = Conversation(project_id=project.id, title=body.initial_message.content[:80])
+            conversation = Conversation(project_id=project.id, title=body.initial_message.content[:80] or "资料研究")
             session.add(conversation)
             session.flush()
             return make_message(session, project, conversation, body.initial_message)
@@ -517,9 +572,26 @@ def create_app(start_dispatcher=True):
 
     @app.get("/api/runs/{id}", response_model=schemas.RunResponse, tags=["runs"])
     def run_status(id: UUID, session: DB):
+        from app.conversation_execution import activities_for_run
+        from app.chat_streaming import stream_for_run
         run = owned(session, ResearchRun, id)
         steps = session.scalars(select(RunStep).where(RunStep.run_id == run.id).order_by(RunStep.created_at)).all()
-        return {**record(run, exclude=("lease_token", "payload")), "steps": [record(item) for item in steps]}
+        input_request = dict(run.input_request) if run.input_request else None
+        if input_request and input_request["kind"] == "import_conflicts":
+            input_request["conflicts"] = [record(row) for row in session.scalars(select(ImportConflict).where(
+                ImportConflict.version_id == run.payload["dataset_version_id"], ImportConflict.resolution.is_(None)))]
+        if input_request and input_request["kind"] in {"scope_confirmation", "plan_confirmation", "execution_confirmation"}:
+            from app.conversation_execution import scope_editable_for_run
+            scope = session.get(ScopeVersion, run.scope_version_id)
+            input_request["scope"] = {**(scope.content if scope else {}), **input_request.get("scope", {}),
+                                      **input_request.get("changes", {})}
+            input_request["scope_editable"] = (scope_editable_for_run(run)
+                                               if input_request["kind"] == "execution_confirmation" else True)
+        return {**record(run, exclude=("lease_token", "payload")), "steps": [record(item) for item in steps],
+                "input_request": input_request, "plan": run.payload.get("plan"),
+                "origin_message_id": run.payload.get("message_id") or session.scalar(select(Message.id).where(
+                    Message.run_id == run.id, Message.role == "user")), "activities": activities_for_run(session, run),
+                "stream": stream_for_run(session, run)}
 
     @app.get("/api/runs/{id}/events", tags=["runs"], response_class=StreamingResponse,
              responses={200: {"content": {"text/event-stream": {"schema": {"type": "string"}}}}})
@@ -548,27 +620,102 @@ def create_app(start_dispatcher=True):
                 for event in events:
                     after = event["seq"]
                     yield f"id: {after}\nevent: {event['event_type']}\ndata: {json.dumps(event, ensure_ascii=False)}\n\n"
-                if state in TERMINAL and len(events) < 200:
+                if state in TERMINAL | {"waiting_input"} and len(events) < 200:
                     break
                 if not events:
                     yield ": heartbeat\n\n"
-                await asyncio.sleep(1)
+                await asyncio.sleep(0.25)
         return StreamingResponse(stream(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
     @app.post("/api/runs/{id}/inputs", response_model=schemas.TaskResponse, status_code=202, tags=["runs"])
     def submit_input(id: UUID, body: schemas.RunInput, request: Request, response: Response, session: DB):
         def action():
             initial = owned(session, ResearchRun, id)
-            project = owned(session, Project, initial.project_id, lock=True)
+            project = owned(session, Project, initial.project_id, lock=True) if initial.project_id else None
             run = owned(session, ResearchRun, id, lock=True)
             if run.status != "waiting_input" or not run.input_request or run.input_request["id"] != str(body.input_request_id):
                 raise AppError(409, "INPUT_REQUEST_CONFLICT", "此确认请求已经失效")
-            if body.values.get("confirmed") is not True:
-                raise AppError(422, "CONFIRMATION_REQUIRED", "需要明确确认范围")
-            scope = update_scope(session, project, body.expected_scope_version_id, body.values.get("scope", {}), True)
-            run.scope_version_id, run.input_request, run.status, run.dispatch_pending = scope.id, None, "queued", True
-            emit_event(session, run.id, "step.updated", {"step": "scope_confirmation", "status": "succeeded"})
-            return task_result(run, scope_version_id=scope.id)
+            kind = run.input_request["kind"]
+            submitted_scope = body.values.get("scope")
+            if "scope" in body.values and not isinstance(submitted_scope, dict):
+                raise AppError(422, "INVALID_SCOPE", "研究范围需要使用表格字段值")
+            if kind == "execution_confirmation":
+                from app.conversation_execution import execution_context, execution_request, scope_editable_for_run
+                if body.values.get("confirmed") is not True:
+                    raise AppError(422, "CONFIRMATION_REQUIRED", "请明确确认本轮操作")
+                if run.input_request.get("context") != execution_context(session, run):
+                    run.input_request = execution_request(session, run, run.input_request["actions"], changed=True)
+                    emit_event(session, run.id, "input.required", run.input_request)
+                    return task_result(run)
+                if submitted_scope is not None:
+                    existing_scope = session.get(ScopeVersion, run.scope_version_id)
+                    confirmed_scope = validate_scope({**existing_scope.content, **submitted_scope})
+                    if confirmed_scope != existing_scope.content:
+                        if not scope_editable_for_run(run):
+                            raise AppError(409, "SCOPE_SNAPSHOT_FIXED", "此操作采用报告的固定范围，请在生成新报告时调整范围")
+                        scope = update_scope(session, project, body.expected_scope_version_id, confirmed_scope, True)
+                        run.scope_version_id = scope.id
+                        run.payload = {key: value for key, value in run.payload.items()
+                                       if key not in {"analysis_id", "execution_authorization"}}
+                run.payload = {**run.payload, "execution_authorization": {
+                    "context": execution_context(session, run), "allowed_actions": run.input_request["allowed_actions"]}}
+            elif kind == "import_conflicts":
+                from app.merge_service import resolve_conflicts
+                version = owned(session, DatasetVersion, run.payload["dataset_version_id"])
+                resolve_conflicts(session, version.id, body.values.get("choices", []))
+            elif kind == "dataset_selection":
+                if project.revision != run.input_request.get("expected_project_revision", project.revision):
+                    if body.values.get("confirm_project_change") is not True or body.values.get("expected_revision") != project.revision:
+                        raise AppError(409, "PROJECT_REVISION_CONFLICT", "项目数据或范围已变化，请核对最新状态后重新确认采用数据",
+                                       {"revision": project.revision, "dataset_version_id": project.dataset_version_id})
+                version = owned(session, DatasetVersion, body.values.get("dataset_version_id"))
+                if version.status != "ready":
+                    raise AppError(409, "DATASET_NOT_READY", "所选数据版本尚未就绪")
+                project.dataset_version_id = version.id
+                project.revision += 1
+                run.dataset_version_ids = [version.id]
+            elif kind in {"scope_confirmation", "plan_confirmation"}:
+                if body.values.get("confirmed") is not True:
+                    raise AppError(422, "CONFIRMATION_REQUIRED", "需要明确确认研究范围")
+                if project.scope_version_id != run.scope_version_id and body.values.get("confirm_scope_change") is not True:
+                    raise AppError(409, "SCOPE_VERSION_CONFLICT", "项目范围已变化，请核对最新范围后明确重新确认",
+                                   {"scope_version_id": project.scope_version_id})
+                proposed = run.input_request.get("changes", {}) if kind == "plan_confirmation" else run.input_request.get("scope", {})
+                changes = {**proposed, **(submitted_scope or {})}
+                scope = update_scope(session, project, body.expected_scope_version_id, changes, True)
+                run.scope_version_id = scope.id
+                if kind == "plan_confirmation":
+                    run.payload = {**run.payload, "plan_confirmed": True,
+                                   "plan": {**run.payload.get("plan", {}), "scope_changes": changes}}
+                run.payload = {key: value for key, value in run.payload.items()
+                               if key not in {"analysis_id", "execution_authorization"}}
+            elif kind == "report_target":
+                if body.values.get("confirmed") is not True:
+                    raise AppError(422, "CONFIRMATION_REQUIRED", "请明确确认修改目标与报告采用版本")
+                version = owned(session, ReportVersion, body.values.get("base_version_id"))
+                report = owned(session, Report, version.report_id, lock=True)
+                if report.project_id != project.id:
+                    raise AppError(404, "REPORT_NOT_FOUND", "报告不属于此项目")
+                if report.current_version_id != body.values.get("expected_current_version_id"):
+                    raise AppError(409, "REPORT_VERSION_CONFLICT", "采用版本已经变化，请重新选择")
+                targets = body.values.get("block_ids", [])
+                has_operations = bool(run.payload.get("plan", {}).get("operations"))
+                if not isinstance(targets, list) or (not targets and not has_operations) or any(
+                    target not in {block["id"] for block in version.content["blocks"]} for target in targets):
+                    raise AppError(422, "BLOCK_TARGET_REQUIRED", "请选择此版本内需要修改的正文块")
+                report.current_version_id = version.id
+                run.scope_version_id, run.dataset_version_ids = version.scope_version_id, list(version.dataset_version_ids)
+                run.payload = {**run.payload, "target_version_id": version.id, "target_current_id": version.id,
+                               "target_block_ids": targets}
+            elif kind == "chart_data_confirmation":
+                if body.values.get("confirmed") is not True:
+                    raise AppError(422, "CONFIRMATION_REQUIRED", "需要明确确认图表筛选")
+                run.payload = {**run.payload, "chart_data_confirmed": True}
+            else:
+                raise AppError(422, "UNKNOWN_INPUT_KIND", "不支持此确认类型")
+            run.input_request, run.status, run.dispatch_pending = None, "queued", True
+            emit_event(session, run.id, "step.updated", {"step": kind, "status": "succeeded"})
+            return task_result(run, scope_version_id=run.scope_version_id)
         return mutate(session, request, response, body.model_dump(mode="json"), action, 202)
 
     @app.post("/api/runs/{id}/cancel", response_model=schemas.TaskResponse, tags=["runs"])
@@ -579,10 +726,14 @@ def create_app(start_dispatcher=True):
                 run.cancellation_requested = True
                 run.status = "cancelling" if run.status in {"running", "cancelling"} else "cancelled"
                 run.dispatch_pending = False
-                if run.kind == "import" and run.status == "cancelled":
+                if run.kind in {"import", "merge_import"} and run.status == "cancelled":
                     version = session.get(DatasetVersion, run.payload["dataset_version_id"])
                     if version.status != "ready":
                         version.status = "cancelled"
+                if run.kind == "parse_material" and run.status == "cancelled":
+                    material = session.get(Material, run.payload["material_id"])
+                    if material and material.status != "ready":
+                        material.status = "cancelled"
                 emit_event(session, run.id, "step.updated" if run.status == "cancelling" else "run.completed", {"status": run.status})
             return task_result(run)
         return mutate(session, request, response, {}, action)
@@ -595,13 +746,25 @@ def create_app(start_dispatcher=True):
                 raise AppError(409, "RUN_NOT_FAILED", "只能重试失败任务")
             run = create_run(session, old.kind, payload=dict(old.payload), conversation_id=old.conversation_id, retry_of_id=old.id)
             run.project_id, run.scope_version_id, run.dataset_version_ids = old.project_id, old.scope_version_id, list(old.dataset_version_ids)
+            origin = (session.get(Message, old.payload["message_id"]) if old.payload.get("message_id") else
+                      session.scalar(select(Message).where(Message.run_id == old.id, Message.role == "user")))
+            if origin and origin.role == "user" and origin.conversation_id == old.conversation_id:
+                origin.run_id = run.id
+                origin.cards = [card for card in origin.cards if card.get("type") != "task"]
+            if old.kind == "parse_material":
+                material = session.get(Material, old.payload["material_id"])
+                material.run_id, material.status, material.error = run.id, "pending", None
+            if old.kind in {"import", "merge_import"}:
+                version = session.get(DatasetVersion, old.payload["dataset_version_id"])
+                if version.status != "ready":
+                    version.status = "pending"
             return task_result(run, retry_of_id=old.id)
         return mutate(session, request, response, {}, action, 202)
 
     @app.get("/api/projects/{id}/analysis", response_model=schemas.AnalysisResponse, tags=["analysis"])
-    def analysis_view(id: UUID, session: DB, run_id: UUID | None = None, view: str = "overview"):
+    def analysis_view(id: UUID, session: DB, run_id: UUID | None = None, view: str = "overview", analysis_id: UUID | None = None):
         project = owned(session, Project, id)
-        analysis_id = project.current_analysis_id
+        analysis_id = str(analysis_id) if analysis_id else project.current_analysis_id
         if run_id:
             run = owned(session, ResearchRun, run_id)
             if run.project_id != project.id:
@@ -612,6 +775,8 @@ def create_app(start_dispatcher=True):
         if not analysis_id:
             return {"status": "not_generated", "analysis_id": None, "data": None}
         analysis = owned(session, AnalysisResult, analysis_id)
+        if analysis.project_id != project.id:
+            raise AppError(404, "ANALYSIS_NOT_FOUND", "分析不属于当前项目")
         selected = analysis.views.get(view)
         if selected is None:
             raise AppError(422, "UNKNOWN_ANALYSIS_VIEW", "不支持的分析视角", list(analysis.views))
@@ -623,28 +788,64 @@ def create_app(start_dispatcher=True):
 
     @app.get("/api/charts/{id}", response_model=schemas.ChartResponse, tags=["analysis"])
     def chart_detail(id: UUID, session: DB, version_id: UUID | None = None):
+        from app.chart_service import snapshot
         chart = owned(session, Chart, id)
-        if version_id and chart.version_id != str(version_id):
-            raise AppError(404, "CHART_VERSION_NOT_FOUND", "图表版本不存在")
-        return record(chart)
+        return {**record(chart), **snapshot(session, chart, str(version_id) if version_id else None), "id": chart.id}
 
     @app.get("/api/evidence/{id}", response_model=schemas.EvidenceResponse, tags=["analysis"])
     def evidence_detail(id: UUID, session: DB):
         return record(owned(session, Evidence, id))
 
-    @app.get("/api/reports/{id}/versions", response_model=schemas.ReportVersionPage, tags=["reports"])
-    def report_versions(id: UUID, session: DB, limit: int = Query(50, ge=1, le=200), cursor: str | None = None):
+    @app.get("/api/reports/{id}/versions", response_model=schemas.ReportVersionPage | schemas.ReportVersionSummaryPage,
+             tags=["reports"])
+    def report_versions(id: UUID, session: DB, limit: int = Query(50, ge=1, le=200), cursor: str | None = None,
+                        summary: bool = False):
         report = owned(session, Report, id)
-        rows = session.scalars(select(ReportVersion).where(ReportVersion.report_id == report.id)).all()
-        result = paginate(rows, limit, cursor, True)
-        result["current_version_id"] = report.current_version_id
-        for item in result["items"]:
+        columns = (ReportVersion.id, ReportVersion.number, ReportVersion.parent_id,
+                   ReportVersion.created_at, ReportVersion.summary) if summary else tuple(ReportVersion.__table__.columns)
+        query = select(*columns).where(ReportVersion.report_id == report.id)
+        if cursor:
+            try:
+                point = json.loads(base64.urlsafe_b64decode(cursor.encode()))
+                created_at = datetime.fromisoformat(point["created_at"])
+                identifier = str(UUID(point["id"]))
+                if created_at.utcoffset() is None:
+                    raise ValueError("Cursor timestamp requires a timezone")
+            except (ValueError, KeyError, TypeError, AttributeError, UnicodeDecodeError) as exc:
+                raise AppError(422, "INVALID_CURSOR", "分页游标无效") from exc
+            query = query.where(tuple_(ReportVersion.created_at, ReportVersion.id) < (created_at, identifier))
+        rows = session.execute(query.order_by(ReportVersion.created_at.desc(), ReportVersion.id.desc())
+                               .limit(limit + 1)).mappings().all()
+        items = [dict(row) for row in rows[:limit]]
+        next_cursor = None
+        if len(rows) > limit:
+            last = items[-1]
+            next_cursor = base64.urlsafe_b64encode(json.dumps({
+                "created_at": last["created_at"].isoformat(), "id": last["id"]}).encode()).decode()
+        for item in items:
             item["is_current"] = item["id"] == report.current_version_id
-        return result
+        total = session.scalar(select(func.count()).select_from(ReportVersion).where(ReportVersion.report_id == report.id))
+        return {"items": items, "next_cursor": next_cursor, "total": total, "returned_count": len(items),
+                "current_version_id": report.current_version_id}
 
     @app.get("/api/reports/{id}/versions/{version}", response_model=schemas.ReportVersionResponse, tags=["reports"])
-    def report_version(id: UUID, version: UUID, session: DB):
+    def report_version(id: UUID, version: UUID, session: DB, view: Literal["full", "display"] = "full"):
         report = owned(session, Report, id)
+        if view == "display":
+            metadata = [column for column in ReportVersion.__table__.columns if column.key != "content"]
+            fields = ("title", "layout", "blocks")
+            row = session.execute(select(*metadata, *(ReportVersion.content[key].label(f"display_{key}") for key in fields))
+                                  .join(Report, ReportVersion.report_id == Report.id)
+                                  .join(Project, Report.project_id == Project.id)
+                                  .where(ReportVersion.id == str(version), Project.owner_id == get_settings().dev_owner_id)
+                                  ).mappings().first()
+            if not row:
+                raise AppError(404, "NOT_FOUND", "记录不存在")
+            if row["report_id"] != report.id:
+                raise AppError(404, "REPORT_VERSION_NOT_FOUND", "报告版本不属于此报告")
+            result = dict(row)
+            result["content"] = {key: result.pop(f"display_{key}") for key in fields}
+            return result
         row = owned(session, ReportVersion, version)
         if row.report_id != report.id:
             raise AppError(404, "REPORT_VERSION_NOT_FOUND", "报告版本不属于此报告")
@@ -662,6 +863,19 @@ def create_app(start_dispatcher=True):
                 raise AppError(409, "REPORT_VERSION_CONFLICT", "请先切回需要修改的基础版本")
             payload = {**body.model_dump(mode="json", exclude_none=True), "report_id": report.id}
             run = create_run(session, "revise_report", project, payload)
+            if body.conversation_id:
+                conversation = owned(session, Conversation, body.conversation_id)
+                if conversation.project_id != project.id:
+                    raise AppError(404, "CONVERSATION_NOT_FOUND", "对话不属于此项目")
+                run.conversation_id = conversation.id
+                labels = {"set_title": "修改标题", "replace_text": "修改文字", "insert_block": "添加内容",
+                          "remove_block": "移除内容", "move_block": "调整顺序", "append_roadmap": "追加布局与路线图",
+                          "insert_chart": "插入图表", "update_chart": "更新图表", "set_layout": "调整页面排版",
+                          "set_chart_layout": "调整图表排版"}
+                session.add(Message(conversation_id=conversation.id, run_id=run.id, role="user",
+                    content=body.instruction or ("修改报告正文" if not body.operations else "更新报告：" + "、".join(labels[op.op] for op in body.operations)),
+                    reference={"report_version_id": base.id, "block_id": body.block_id},
+                    cards=[{"type": "task", "run_id": run.id, "kind": "revise_report"}]))
             run.scope_version_id, run.dataset_version_ids = base.scope_version_id, list(base.dataset_version_ids)
             return task_result(run)
         return mutate(session, request, response, body.model_dump(mode="json"), action, 202)
@@ -700,6 +914,8 @@ def create_app(start_dispatcher=True):
             raise AppError(404, "FILE_NOT_FOUND", "文件未生成或已不可用")
         return FileResponse(path, media_type=file.media_type, filename=file.original_name)
 
+    from app.extension_api import register
+    register(app)
     return app
 
 

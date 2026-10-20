@@ -21,8 +21,8 @@ from app.db import session_scope
 from app.errors import AppError
 from app.files import store_bytes
 from app.models import (
-    AnalysisResult, Chart, DatasetVersion, Evidence, PatentApplication,
-    PatentPublication, Project, Report, ReportVersion, ScopeVersion, StoredFile,
+    AnalysisResult, Chart, Conversation, DatasetVersion, Evidence, PatentApplication,
+    PatentPublication, Project, Report, ReportVersion, ResearchRun, ScopeVersion, StoredFile,
 )
 
 
@@ -36,7 +36,32 @@ DEFAULT_REPORT_LAYOUT = {
 
 def _version_result(report, version):
     return {"report_id": report.id, "report_version_id": version.id,
-            "number": version.number, "current_version_id": report.current_version_id}
+            "number": version.number, "current_version_id": report.current_version_id,
+            "parent_id": version.parent_id}
+
+
+def _run_lineage(session, run_id):
+    identifiers = []
+    while run_id and run_id not in identifiers:
+        identifiers.append(run_id)
+        run = session.get(ResearchRun, run_id)
+        run_id = run.retry_of_id if run else None
+    return identifiers
+
+
+def _saved_version(ctx):
+    with session_scope() as session:
+        ctx.guard(session)
+        lineage = _run_lineage(session, ctx.run_id)
+        versions = {version.run_id: version for version in session.scalars(select(ReportVersion).where(
+            ReportVersion.run_id.in_(lineage))).all()}
+        previous = next((versions[run_id] for run_id in lineage if run_id in versions), None)
+        if previous:
+            report = session.get(Report, previous.report_id)
+            if report.project_id != ctx.project_id:
+                raise AppError(404, "REPORT_VERSION_NOT_FOUND", "报告版本不存在")
+            return _version_result(report, previous)
+    return None
 
 
 def _project(session, project_id):
@@ -68,11 +93,9 @@ def _load_snapshot(ctx):
                             "file_name": source_file.original_name, "sha256": source_file.sha256,
                             "rule_version": dataset.rule_version, "quality": dataset.quality,
                             "source_metadata": dataset.source_metadata})
-        charts = [{"id": chart.id, "version_id": chart.version_id, "kind": chart.kind,
-                   "option": chart.option, "data": chart.data, "provenance": chart.provenance,
-                   "selections": chart.selections}
-                  for chart in session.scalars(select(Chart).where(
-                      Chart.analysis_id == analysis.id).order_by(Chart.kind, Chart.id))]
+        from app.chart_service import snapshot as chart_snapshot
+        charts = [chart_snapshot(session, chart) for chart in session.scalars(select(Chart).where(
+            Chart.analysis_id == analysis.id).order_by(Chart.kind, Chart.id))]
         evidence = [{"id": row.id, "kind": row.kind, "application_id": row.application_id,
                      "content": row.content}
                     for row in session.scalars(select(Evidence).where(
@@ -110,8 +133,11 @@ def build_report_content(snapshot):
         f"本报告统计当前确认范围内的 {summary.get('application_count', 0)} 条申请记录，"
         f"涉及 {summary.get('publication_count', 0)} 个公开标识及 "
         f"{summary.get('abstract_count', 0)} 份行级摘要。结论仅适用于已导入样本，不能代表全部检索结果。"))
-    scope_labels = {"query": "检索词", "keyword": "检索词", "region": "地区", "applicant": "申请人",
-                    "ipc": "IPC", "application_start": "申请起始日期", "application_end": "申请结束日期"}
+    scope_labels = {"industry": "研究行业", "goal": "决策目标", "need": "应用需求", "focus": "关注对象",
+                    "q": "统计关键词", "query": "检索词", "keyword": "检索词", "region": "地区",
+                    "source_region": "来源地区说明", "coverage": "覆盖说明", "applicant": "申请人", "ipc": "IPC",
+                    "start": "申请起始年份", "end": "申请结束年份",
+                    "application_start": "申请起始日期", "application_end": "申请结束日期"}
     scope_values = {**snapshot["scope"], **(snapshot["scope"].get("filters") or {})}
     scope_description = "；".join(f"{label}：{scope_values[key]}" for key, label in scope_labels.items()
                                   if scope_values.get(key))
@@ -149,11 +175,80 @@ def build_report_content(snapshot):
                     chart_id=chart["id"], chart_version_id=chart["version_id"],
                     caption=chart["data"].get("title", heading),
                     layout={"width_percent": 100, "alignment": "center"})
+    technology = snapshot.get("views", {}).get("technology", {})
+    semantic_ready = technology.get("status") == "ready" and technology.get("data", {}).get("classification") == "semantic"
+    if semantic_ready:
+        data = technology["data"]
+        coverage = data.get("coverage", {})
+        add("semantic-heading", "heading", text="全量语义分类与技术结构", level=1)
+        add("semantic-coverage", "paragraph", text=(
+            f"已处理 {coverage.get('processed_count', 0)} 条入选申请，可靠归类 {coverage.get('classified_count', 0)} 条，"
+            f"待复核 {coverage.get('review_count', 0)} 条。分类归属及数量来自固定分析版本，待复核记录仍保留在总体中。"))
+        themes = {}
+        for dimension, label in (("elements", "基础要素"), ("methods", "技术方法"), ("scenarios", "应用场景")):
+            rows = data.get("taxonomy", {}).get(dimension, [])
+            themes.update({item["id"]: item["label"] for item in rows})
+            add(f"semantic-{dimension}-heading", "heading", text=label, level=2)
+            add(f"semantic-{dimension}-table", "table", columns=[label, "涉及申请数"],
+                rows=[[item["label"], str(item.get("count", 0))] for item in rows], caption="多标签分别计数")
+            for chart in snapshot["charts"]:
+                if chart["kind"] == dimension:
+                    add(f"semantic-{dimension}-chart", "chart", chart=deepcopy(chart), chart_id=chart["id"],
+                        chart_version_id=chart["version_id"], caption=label,
+                        layout={"width_percent": 100, "alignment": "center"})
+        landscape = snapshot.get("views", {}).get("landscape", {}).get("data", {})
+        if landscape.get("subject_matrix"):
+            add("matrix-heading", "heading", text="申请人与技术方法交叉统计", level=1)
+            add("matrix-table", "table", columns=["申请人", "技术方法", "申请数"], rows=[
+                [item["applicant"], themes.get(item["theme_id"], item["theme_id"]), str(item["count"])]
+                for item in landscape["subject_matrix"]], caption="逐条申请归属计算；共同申请人全计数")
+        opportunities = snapshot.get("views", {}).get("opportunities", {}).get("data", {}).get("items", [])
+        if opportunities:
+            originals = {item["application_id"]: item for item in snapshot.get("evidence", []) if item.get("application_id")}
+            add("directions-heading", "heading", text="候选研究方向与风险关注", level=1)
+            for item in opportunities:
+                add(f"direction-{item['id']}", "heading", text=f"{item.get('priority', '')} {item['title']}", level=2,
+                    direction_id=item["id"])
+                add(f"direction-description-{item['id']}", "paragraph", text=item.get("description", ""), direction_id=item["id"])
+                add(f"direction-support-{item['id']}", "paragraph", text=(
+                    f"样本支持记录 {item.get('support_count', 0)} 条。{item.get('priority_reason', '')}"
+                    "外部补检尚未执行，不能据此认定技术空白、可专利性或法律结论。"), direction_id=item["id"],
+                    application_ids=item.get("supporting_application_ids", []))
+                for index, application_id in enumerate(item.get("supporting_application_ids", [])[:3]):
+                    evidence = originals.get(application_id)
+                    if evidence:
+                        original = evidence["content"]
+                        quotes = original.get("semantic_evidence", [])
+                        quote = next((part.get("quote") for part in quotes if part.get("theme_id") in
+                                      {item.get("method_theme_id"), item.get("scenario_theme_id")}), original.get("abstract", "")[:280])
+                        add(f"direction-evidence-{item['id']}-{index}", "paragraph", text=(
+                            f"原文依据：{original.get('application_number', application_id)}；"
+                            f"工作表 {original.get('source_sheet', '')}，第 {original.get('source_row', '')} 行。{quote}"),
+                            direction_id=item["id"], application_id=application_id, evidence_id=evidence["id"])
+                for index, comparison in enumerate(item.get("counterexample_search", {}).get("results", [])[:3]):
+                    evidence = originals.get(comparison["application_id"])
+                    number = evidence["content"].get("application_number") if evidence else comparison["application_id"]
+                    add(f"direction-comparison-{item['id']}-{index}", "paragraph", text=(
+                        f"本地相近记录（待人工核对）：{number}。{comparison.get('quote', '')}"),
+                        direction_id=item["id"], application_id=comparison["application_id"],
+                        evidence_id=evidence["id"] if evidence else None)
+                for risk in item.get("risks", []):
+                    add(f"risk-{risk['id']}", "paragraph", text=f"风险关注：{risk['title']}。{risk.get('reason', '')}",
+                        risk_id=risk["id"], direction_id=item["id"])
+        blocks.extend(_roadmap_blocks({"source": snapshot}, snapshot["analysis_id"], allow_unavailable=True))
+        geography = snapshot.get("views", {}).get("geography", {}).get("data", {})
+        if geography.get("country"):
+            add("source-country-heading", "heading", text="申请人来源国家", level=1)
+            add("source-country-table", "table", columns=["来源国家", "申请数"],
+                rows=[[item["country"], str(item["count"])] for item in geography["country"]],
+                caption="共同来源国家全计数；不等于保护地")
+            add("source-country-limit", "paragraph", text="省市、有效保护地与同族视角缺少必要字段，当前不能生成对应结论。")
     add("limits-heading", "heading", text="可用结论与待补充资料", level=1)
     add("limits", "paragraph", text=(
         "本次提供年度、申请人和 IPC 描述性统计，以及原文摘要定位。"
-        "IPC 分类不能直接替代语义技术路线。语义技术路线、机会判断和地域保护布局尚未形成结论；"
-        "需要相应模型能力及更完整的原始字段、权利要求和外部补检证据。"))
+        + ("语义分类覆盖全部入选记录；候选方向与阶段行动仅用于后续核查，不表示已证明的技术空白。" if semantic_ready else
+           "IPC 分类不能直接替代语义技术路线。当前固定分析未形成语义分类和候选路线结论。")
+        + "省市、有效保护地和同族视角缺少必要字段；仍需权利要求、法律状态及外部补检证据。"))
     add("representatives-heading", "heading", text="样本记录与原文证据附录", level=1)
     add("representatives-method", "paragraph", text=(
         "以下按申请日期从新到旧列出最多五条样本记录，仅用于追溯原文，不代表技术重要性排名。"
@@ -176,6 +271,9 @@ def build_report_content(snapshot):
 
 
 def generate_report(ctx):
+    previous = _saved_version(ctx)
+    if previous:
+        return previous
     snapshot = ctx.step("report_snapshot", lambda: _load_snapshot(ctx))
     content = build_report_content(snapshot)
     if ctx.payload.get("report_mode") == "ai":
@@ -208,7 +306,7 @@ def generate_report(ctx):
         version = ReportVersion(report_id=report.id, number=report.version_counter,
             parent_id=report.current_version_id, run_id=ctx.run_id, analysis_id=snapshot["analysis_id"],
             scope_version_id=snapshot["scope_version_id"], dataset_version_ids=snapshot["dataset_version_ids"],
-            content=content, chart_ids=[chart["id"] for chart in snapshot["charts"]],
+            content=content, chart_ids=list(dict.fromkeys(block["chart_id"] for block in content["blocks"] if block["type"] == "chart")),
             summary="根据固定数据与范围生成统计简报", instruction="生成统计简报",
             conversation_id=getattr(ctx, "conversation_id", None))
         session.add(version)
@@ -236,7 +334,191 @@ def replace_block(content, block_id, replacement):
     return content
 
 
+def _roadmap_blocks(content, namespace, allow_unavailable=False):
+    view = content.get("source", {}).get("views", {}).get("roadmap", {})
+    items = view.get("data", {}).get("items", [])
+    if view.get("status") != "ready" or not items:
+        if allow_unavailable:
+            return []
+        raise AppError(409, "ROADMAP_UNAVAILABLE", "当前报告固定分析版本尚无可追加的布局与路线图，请先完成全量语义分析")
+    blocks = []
+
+    def add(key, kind, **values):
+        blocks.append({"id": str(uuid5(NAMESPACE_URL, f"patentcompass:{namespace}:roadmap:{key}")),
+                       "type": kind, **values})
+
+    add("heading", "heading", text="布局与路线图", level=1, section="roadmap")
+    for item in items:
+        direction_id = item["id"]
+        add(direction_id, "heading", text=f"{item.get('priority', '')} {item['title']}", level=2,
+            direction_id=direction_id)
+        add(direction_id + "-conditions", "paragraph", text="推进条件：" + "；".join(item.get("conditions", [])),
+            direction_id=direction_id)
+        for phase in item.get("phases", []):
+            add(phase["id"], "heading", text=phase["title"], level=3, direction_id=direction_id, phase_id=phase["id"])
+            for index, action in enumerate(phase.get("actions", [])):
+                add(f"{phase['id']}-action-{index}", "paragraph", text=(
+                    f"行动：{action['title']}；负责人：{action.get('owner', '待分配')}；"
+                    f"状态：{'待外部验证' if action.get('status') == 'pending_external' else '待执行'}。"),
+                    direction_id=direction_id, action_id=action.get("id"))
+        add(direction_id + "-boundary", "paragraph", text="外部补检尚未执行；本节为样本核查计划，不能替代完整检索或法律判断。",
+            direction_id=direction_id, application_ids=item.get("supporting_application_ids", []))
+    return blocks
+
+
+def _validated_layout(change, *, chart=False):
+    if not isinstance(change, dict) or not change:
+        raise AppError(422, "INVALID_REPORT_LAYOUT", "请提供有效的排版设置")
+    if chart:
+        if set(change) - {"width_percent", "alignment"}:
+            raise AppError(422, "INVALID_REPORT_LAYOUT", "图表排版仅支持宽度和对齐")
+        if "width_percent" in change and change["width_percent"] not in {50, 100}:
+            raise AppError(422, "INVALID_REPORT_LAYOUT", "图表宽度只能为 50 或 100")
+        if "alignment" in change and change["alignment"] not in {"left", "center", "right"}:
+            raise AppError(422, "INVALID_REPORT_LAYOUT", "无效的图表对齐方式")
+        return deepcopy(change)
+    allowed = {"paper_size", "page_width_inches", "page_height_inches", "margins_inches", "font_family", "body_font_pt", "chart_width_inches"}
+    if set(change) - allowed:
+        raise AppError(422, "INVALID_REPORT_LAYOUT", "报告排版包含不支持的设置")
+    for key, value in change.items():
+        if key == "paper_size" and value != "A4":
+            raise AppError(422, "INVALID_REPORT_LAYOUT", "当前仅支持 A4 页面")
+        if key == "font_family" and (not isinstance(value, str) or not value.strip() or len(value) > 100):
+            raise AppError(422, "INVALID_REPORT_LAYOUT", "无效的字体名称")
+        if key == "margins_inches":
+            if not isinstance(value, dict) or set(value) - {"top", "bottom", "left", "right"}:
+                raise AppError(422, "INVALID_REPORT_LAYOUT", "页边距设置无效")
+            if any(isinstance(item, bool) or not isinstance(item, (int, float)) or not 0.25 <= item <= 2 for item in value.values()):
+                raise AppError(422, "INVALID_REPORT_LAYOUT", "页边距须在 0.25 到 2 英寸之间")
+        bounds = {"page_width_inches": (6, 12), "page_height_inches": (8, 16), "body_font_pt": (8, 24), "chart_width_inches": (2, 10)}
+        if key in bounds and (isinstance(value, bool) or not isinstance(value, (int, float)) or not bounds[key][0] <= value <= bounds[key][1]):
+            raise AppError(422, "INVALID_REPORT_LAYOUT", "页面、字体或图表尺寸超出支持范围")
+    return deepcopy(change)
+
+
+def _new_block(raw, block_id):
+    if not isinstance(raw, dict) or set(raw) - {"id", "type", "text", "level", "columns", "rows", "caption"}:
+        raise AppError(422, "INVALID_REPORT_BLOCK", "新增正文块格式无效")
+    block = {**deepcopy(raw), "id": raw.get("id") or block_id}
+    if not isinstance(block["id"], str) or not 1 <= len(block["id"]) <= 200:
+        raise AppError(422, "INVALID_REPORT_BLOCK", "正文块标识无效")
+    if block.get("type") in {"paragraph", "heading"}:
+        if not isinstance(block.get("text"), str) or len(block["text"]) > 40000:
+            raise AppError(422, "INVALID_REPORT_BLOCK", "正文块需要有效文字")
+        if block["type"] == "heading" and block.get("level", 1) not in {1, 2, 3}:
+            raise AppError(422, "INVALID_REPORT_BLOCK", "章节标题层级只能为 1、2 或 3")
+    elif block.get("type") == "table":
+        columns, rows = block.get("columns"), block.get("rows")
+        if (not isinstance(columns, list) or not 1 <= len(columns) <= 10 or
+                any(not isinstance(column, str) for column in columns) or not isinstance(rows, list) or len(rows) > 5200 or
+                any(not isinstance(row, list) or len(row) != len(columns) or
+                    any(not isinstance(cell, (str, int, float)) for cell in row) for row in rows)):
+            raise AppError(422, "INVALID_REPORT_BLOCK", "表格列、行或单元格格式无效")
+    else:
+        raise AppError(422, "INVALID_REPORT_BLOCK", "新增正文块仅支持标题、段落或表格；图表请使用插入图表操作")
+    return block
+
+
+def apply_operations(session, project_id, content, operations, namespace):
+    """Apply to a detached copy; any invalid operation aborts the whole revision."""
+    from app.chart_service import snapshot as chart_snapshot
+
+    result = deepcopy(content)
+    blocks = result["blocks"]
+
+    def locate(block_id):
+        block = next((item for item in blocks if item["id"] == block_id), None)
+        if block is None:
+            raise AppError(404, "BLOCK_NOT_FOUND", "指定正文块不存在", {"block_id": block_id})
+        return block
+
+    def insert(block, after_id):
+        if any(item["id"] == block["id"] for item in blocks):
+            raise AppError(422, "DUPLICATE_REPORT_BLOCK", "正文块标识重复")
+        index = blocks.index(locate(after_id)) + 1 if after_id is not None else 0
+        blocks.insert(index, block)
+
+    def frozen_chart(operation):
+        chart = session.get(Chart, str(operation.get("chart_id")))
+        if not chart or chart.project_id != project_id:
+            raise AppError(404, "CHART_NOT_FOUND", "图表不存在或不属于当前项目")
+        snapshot = chart_snapshot(session, chart, str(operation["chart_version_id"]) if operation.get("chart_version_id") else None)
+        existing = {item["id"] for item in result.get("evidence_snapshot", [])}
+        for evidence in session.scalars(select(Evidence).where(Evidence.analysis_id == chart.analysis_id)).all():
+            if evidence.id not in existing:
+                result.setdefault("evidence_snapshot", []).append({"id": evidence.id, "kind": evidence.kind,
+                    "application_id": evidence.application_id, "content": deepcopy(evidence.content)})
+        return snapshot
+
+    for index, operation in enumerate(operations):
+        op = operation["op"]
+        block_id = operation.get("block_id")
+        new_id = str(uuid5(NAMESPACE_URL, f"patentcompass:revision:{namespace}:{index}"))
+        if op == "set_title":
+            text = operation.get("text")
+            if not isinstance(text, str) or not text.strip() or len(text) > 300:
+                raise AppError(422, "INVALID_REPORT_TITLE", "报告标题需要 1 到 300 个字符")
+            result["title"] = text.strip()
+        elif op == "replace_text":
+            block = locate(block_id)
+            if block["type"] not in {"heading", "paragraph"} or not isinstance(operation.get("text"), str):
+                raise AppError(422, "BLOCK_TYPE_UNSUPPORTED", "文字修改仅支持标题和段落")
+            block["text"] = operation["text"]
+        elif op == "insert_block":
+            insert(_new_block(operation.get("block"), new_id), operation.get("after_id"))
+        elif op == "remove_block":
+            blocks.remove(locate(block_id))
+        elif op == "move_block":
+            block = locate(block_id)
+            if operation.get("after_id") == block_id:
+                raise AppError(422, "INVALID_BLOCK_POSITION", "正文块不能移动到自身之后")
+            if operation.get("after_id") is not None:
+                locate(operation["after_id"])
+            blocks.remove(block)
+            insert(block, operation.get("after_id"))
+        elif op == "append_roadmap":
+            if any(block.get("section") == "roadmap" for block in blocks):
+                raise AppError(409, "ROADMAP_ALREADY_PRESENT", "当前报告已包含布局与路线图章节")
+            blocks.extend(_roadmap_blocks(result, namespace))
+        elif op in {"insert_chart", "update_chart"}:
+            chart = frozen_chart(operation)
+            if op == "insert_chart":
+                block = {"id": new_id, "type": "chart", "layout": {"width_percent": 100, "alignment": "center"}}
+            else:
+                block = locate(block_id)
+                if block["type"] != "chart":
+                    raise AppError(422, "BLOCK_TYPE_UNSUPPORTED", "此操作需要指定图表块")
+            block.update({"chart": chart, "chart_id": chart["id"], "chart_version_id": chart["version_id"],
+                          "caption": operation.get("text") or chart["data"].get("title", chart["kind"])})
+            if operation.get("layout"):
+                block["layout"] = {**block.get("layout", {}), **_validated_layout(operation["layout"], chart=True)}
+            if op == "insert_chart":
+                insert(block, operation.get("after_id"))
+        elif op == "set_chart_layout":
+            block = locate(block_id)
+            if block["type"] != "chart":
+                raise AppError(422, "BLOCK_TYPE_UNSUPPORTED", "此操作需要指定图表块")
+            block["layout"] = {**block.get("layout", {}), **_validated_layout(operation.get("layout"), chart=True)}
+        elif op == "set_layout":
+            layout = {**deepcopy(DEFAULT_REPORT_LAYOUT), **result.get("layout", {})}
+            change = _validated_layout(operation.get("layout"))
+            if "margins_inches" in change:
+                change["margins_inches"] = {**layout["margins_inches"], **change["margins_inches"]}
+            layout.update(change)
+            if layout["page_width_inches"] - layout["margins_inches"]["left"] - layout["margins_inches"]["right"] < 2:
+                raise AppError(422, "INVALID_REPORT_LAYOUT", "页面正文区域过窄")
+            result["layout"] = layout
+        else:
+            raise AppError(422, "INVALID_REPORT_OPERATION", "不支持的报告操作")
+    if not blocks:
+        raise AppError(422, "EMPTY_REPORT", "报告至少需要保留一个正文块")
+    return result
+
+
 def revise_report(ctx):
+    previous = _saved_version(ctx)
+    if previous:
+        return previous
     payload = ctx.payload
 
     def prepare():
@@ -247,31 +529,44 @@ def revise_report(ctx):
                 raise AppError(404, "REPORT_VERSION_NOT_FOUND", "报告版本不存在")
             if report.current_version_id != payload["expected_current_version_id"]:
                 raise AppError(409, "REPORT_VERSION_CONFLICT", "当前采用的版本已变化，请重新提交修改")
-            block = next((row for row in base.content["blocks"] if row["id"] == payload["block_id"]), None)
-            if not block:
-                raise AppError(404, "BLOCK_NOT_FOUND", "指定正文块不存在")
-            if block["type"] not in {"paragraph", "heading"}:
-                raise AppError(422, "BLOCK_TYPE_UNSUPPORTED", "首轮仅支持替换段落或标题文字")
-            return {"content": deepcopy(base.content), "analysis_id": base.analysis_id,
+            conversation_id = getattr(ctx, "conversation_id", None) or payload.get("conversation_id")
+            if conversation_id:
+                conversation = session.get(Conversation, conversation_id)
+                if not conversation or conversation.project_id != ctx.project_id:
+                    raise AppError(404, "CONVERSATION_NOT_FOUND", "来源对话不存在或不属于当前项目")
+            block = None
+            content = deepcopy(base.content)
+            if payload.get("operations"):
+                content = apply_operations(session, ctx.project_id, content, payload["operations"], ctx.run_id)
+            else:
+                block = next((row for row in base.content["blocks"] if row["id"] == payload["block_id"]), None)
+                if not block:
+                    raise AppError(404, "BLOCK_NOT_FOUND", "指定正文块不存在")
+                if block["type"] not in {"paragraph", "heading"}:
+                    raise AppError(422, "BLOCK_TYPE_UNSUPPORTED", "文字修改仅支持段落或标题")
+            return {"content": content, "analysis_id": base.analysis_id,
                     "scope_version_id": base.scope_version_id, "dataset_version_ids": base.dataset_version_ids,
-                    "chart_ids": base.chart_ids, "block": deepcopy(block)}
+                    "chart_ids": base.chart_ids, "block": deepcopy(block), "conversation_id": conversation_id}
 
     base = ctx.step("revision_snapshot", prepare)
-    if payload.get("replacement_text") is not None:
+    if payload.get("operations"):
+        content = base["content"]
+    elif payload.get("replacement_text") is not None:
         replacement = payload["replacement_text"]
     else:
         from app.model_provider import chat
 
         def rewrite():
             response = chat([
-                {"role": "system", "content": "只返回修改后的单个正文块文字。遵循指令，保留证据与数据边界，不虚构事实。"},
+                {"role": "system", "content": "只返回修改后的单个正文块文字。遵循指令，保留证据与数据边界，不虚构事实。沿用每项统计的原始总体和维度；申请人排名、IPC排名及年份分布是独立统计，未提供交叉统计时，不能写成某申请人主要涉及某IPC，也不能新增相关性或因果归因。压缩篇幅时优先保留样本范围和核心数量，不把省略的证据说成已全部保留。"},
                 {"role": "user", "content": json.dumps({"instruction": payload["instruction"],
                     "block": base["block"], "source": base["content"]["source"]}, ensure_ascii=False)},
             ])
             return {"text": _response_text(response)}
 
         replacement = ctx.step("revision_text", rewrite)["text"]
-    content = replace_block(base["content"], payload["block_id"], replacement)
+    if not payload.get("operations"):
+        content = replace_block(base["content"], payload["block_id"], replacement)
     ctx.check_cancelled()
     with session_scope() as session:
         ctx.guard(session)
@@ -286,8 +581,10 @@ def revise_report(ctx):
         version = ReportVersion(report_id=report.id, number=report.version_counter,
             parent_id=payload["base_version_id"], run_id=ctx.run_id, analysis_id=base["analysis_id"],
             scope_version_id=base["scope_version_id"], dataset_version_ids=base["dataset_version_ids"],
-            content=content, chart_ids=base["chart_ids"], instruction=payload.get("instruction") or "替换指定文字块",
-            summary=f"修改正文块 {payload['block_id']}", conversation_id=getattr(ctx, "conversation_id", None))
+            content=content, chart_ids=list(dict.fromkeys(block["chart_id"] for block in content["blocks"] if block["type"] == "chart")),
+            instruction=payload.get("instruction") or ("按结构化操作修改报告" if payload.get("operations") else "替换指定文字块"),
+            summary=f"完成 {len(payload['operations'])} 项报告修改" if payload.get("operations") else "修改所选报告文字",
+            conversation_id=base["conversation_id"])
         session.add(version)
         session.flush()
         report.current_version_id = version.id
@@ -333,6 +630,8 @@ def build_docx(content, version_number, *, check_cancelled=lambda: None):
         style.font.name = family
         style.font.color.rgb = RGBColor(0, 0, 0)
         style._element.get_or_add_rPr().rFonts.set(qn("w:eastAsia"), family)
+    for border in document.styles["Title"]._element.xpath("./w:pPr/w:pBdr"):
+        border.getparent().remove(border)
     normal = document.styles["Normal"]
     normal.font.size = Pt(body_size)
     normal.paragraph_format.space_after = Pt(7)
@@ -373,15 +672,17 @@ def build_docx(content, version_number, *, check_cancelled=lambda: None):
                 for row in table.rows:
                     for cell_index, cell in enumerate(row.cells):
                         cell.vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.CENTER
-                        cell.width = Inches(5.2 if cell_index == 0 else 1.2)
+                        usable_width = layout["page_width_inches"] - margins["left"] - margins["right"]
+                        fraction = (0.8 if cell_index == 0 else 0.2) if len(block["columns"]) == 2 else 1 / len(block["columns"])
+                        cell.width = Inches(usable_width * fraction)
                         properties = cell._tc.get_or_add_tcPr()
-                        margins = OxmlElement("w:tcMar")
+                        cell_margins = OxmlElement("w:tcMar")
                         for edge in ("top", "left", "bottom", "right"):
                             margin = OxmlElement(f"w:{edge}")
                             margin.set(qn("w:w"), "90")
                             margin.set(qn("w:type"), "dxa")
-                            margins.append(margin)
-                        properties.append(margins)
+                            cell_margins.append(margin)
+                        properties.append(cell_margins)
                         borders = OxmlElement("w:tcBorders")
                         for edge in ("top", "left", "bottom", "right"):
                             border = OxmlElement(f"w:{edge}")
@@ -398,9 +699,13 @@ def build_docx(content, version_number, *, check_cancelled=lambda: None):
                 path = Path(temporary) / f"chart-{index}.png"
                 render_chart(block["chart"]["option"], path)
                 paragraph = document.add_paragraph()
-                paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                chart_layout = {"width_percent": 100, "alignment": "center", **block.get("layout", {})}
+                paragraph.alignment = {"left": WD_ALIGN_PARAGRAPH.LEFT, "center": WD_ALIGN_PARAGRAPH.CENTER,
+                                       "right": WD_ALIGN_PARAGRAPH.RIGHT}[chart_layout["alignment"]]
                 paragraph.paragraph_format.keep_with_next = True
-                paragraph.add_run().add_picture(str(path), width=Inches(layout["chart_width_inches"]))
+                usable_width = layout["page_width_inches"] - margins["left"] - margins["right"]
+                width = min(layout["chart_width_inches"], usable_width) * chart_layout["width_percent"] / 100
+                paragraph.add_run().add_picture(str(path), width=Inches(width))
                 document.add_paragraph(block.get("caption", ""), "Caption")
                 document.add_paragraph("来源：当前报告固定分析样本；计数单位为申请记录。", "Caption")
     for paragraph in document.paragraphs:
@@ -423,6 +728,17 @@ def export_report(ctx):
     payload = ctx.payload
     if payload.get("format", "docx") != "docx":
         raise AppError(422, "EXPORT_FORMAT_UNSUPPORTED", "首轮仅支持 Word 导出")
+    with session_scope() as session:
+        ctx.guard(session)
+        lineage = _run_lineage(session, ctx.run_id)
+        files = {file.run_id: file for file in session.scalars(select(StoredFile).where(
+            StoredFile.run_id.in_(lineage), StoredFile.kind == "export")).all()}
+        existing = next((files[run_id] for run_id in lineage if run_id in files), None)
+        if existing:
+            if existing.project_id != ctx.project_id:
+                raise AppError(404, "FILE_NOT_FOUND", "导出文件不存在")
+            return {"file_id": existing.id, "download_url": f"/api/files/{existing.id}",
+                    "report_version_id": payload["report_version_id"]}
 
     def prepare():
         with session_scope() as session:

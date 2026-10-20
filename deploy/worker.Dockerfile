@@ -8,8 +8,9 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PATH="/workspace/api/.venv/bin:$PATH" \
     UV_LINK_MODE=copy
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends fonts-noto-cjk fontconfig ca-certificates \
+RUN sed -i 's|http://deb.debian.org|https://deb.debian.org|g' /etc/apt/sources.list.d/debian.sources \
+    && apt-get -o Acquire::Retries=3 update \
+    && apt-get -o Acquire::Retries=3 install -y --no-install-recommends fonts-noto-cjk fontconfig ca-certificates libreoffice-writer \
     && rm -rf /var/lib/apt/lists/* \
     && pip install --no-cache-dir uv==0.7.12
 COPY --from=renderer /usr/local/bin/node /usr/local/bin/node

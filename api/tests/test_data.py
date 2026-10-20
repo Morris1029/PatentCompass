@@ -170,15 +170,19 @@ def test_import_statistics_match_independent_spreadsheet_counts(db_session, proj
     assert db_session.scalar(select(func.count(PatentPublication.id))) == 526
     assert project.current_analysis_id == analysis.id
     workbook = openpyxl.load_workbook(SAMPLE, read_only=True, data_only=True)
-    expected_applicants, expected_ipc, expected_year = Counter(), Counter(), Counter()
+    expected_applicants, expected_ipc, expected_year, expected_countries = Counter(), Counter(), Counter(), Counter()
     for row_value in list(workbook.active.iter_rows(values_only=True))[1:]:
         expected_applicants.update(set(value.strip() for value in row_value[5].split(";")))
         expected_ipc.update(set(value.strip() for value in row_value[4].split(";")))
         expected_year.update([int(row_value[2][:4])])
+        expected_countries.update(set(data_service.split_values(row_value[11])))
     workbook.close()
     assert {r["name"]: r["count"] for r in analysis.summary["applicants"]} == expected_applicants
     assert {r["code"]: r["count"] for r in analysis.summary["ipc"]} == expected_ipc
     assert {r["year"]: r["count"] for r in analysis.summary["yearly"]} == expected_year
+    assert {r["country"]: r["count"] for r in analysis.summary["country"]} == expected_countries == {"CN": 520, "JP": 1, "TJ": 1}
+    assert analysis.views["geography"]["status"] == "ready"
+    assert set(analysis.views["geography"]["data"]["unavailable"]) == {"province", "protection", "family"}
     chart = db_session.scalar(select(Chart).where(Chart.analysis_id == analysis.id, Chart.kind == "applicants"))
     name = chart.data["rows"][0]["value"]
     historical = data_service.search_patents(db_session, project, {"application_ids": chart.selections["values"][name]})
@@ -226,3 +230,50 @@ def test_semantic_search_requires_index_and_uses_pgvector(db_session, project, c
     limited = data_service.search_patents(db_session, project, {"mode": "semantic", "q": "landing", "limit": 3,
                                                               "application_ids": limited_ids})
     assert {item.id for item in limited["items"]} == set(limited_ids)
+
+
+def test_embedding_batches_follow_config_and_checkpoint_model_and_boundaries(db_session, project, context_factory, monkeypatch):
+    from datetime import date
+    from sqlalchemy import func, select
+    from app.models import Dataset, DatasetVersion, PatentApplication, PatentEmbedding, RunStep, StoredFile
+
+    source = StoredFile(owner_id=project.owner_id, kind="upload", key="upload/batch.xlsx", original_name="batch.xlsx",
+                        media_type="application/octet-stream", sha256="a" * 64, size=1)
+    dataset = Dataset(owner_id=project.owner_id, name="Embedding batch sample", source_sha256="a" * 64)
+    db_session.add_all([source, dataset])
+    db_session.flush()
+    version = DatasetVersion(dataset_id=dataset.id, source_file_id=source.id, status="ready")
+    db_session.add(version)
+    db_session.flush()
+    db_session.add_all([PatentApplication(dataset_version_id=version.id, application_number=f"BATCH{index}",
+                                         application_date=date(2020, 1, 1), title=f"UAV {index}", abstract="Landing control",
+                                         source_sheet="Sheet1", source_row=index + 2) for index in range(25)])
+    project.dataset_version_id = version.id
+    db_session.flush()
+    settings = Settings(_env_file=None, embedding_base_url="https://test.invalid/v1", embedding_api_key="test",
+                        embedding_model="batch-model", embedding_batch_size=10)
+    monkeypatch.setattr(data_service, "get_settings", lambda: settings)
+    sizes = []
+
+    def controlled_embed(texts):
+        if texts:
+            sizes.append(len(texts))
+        return [[1., 0.] for _ in texts]
+
+    monkeypatch.setattr(data_service, "embed", controlled_embed)
+    context = context_factory(project, "index", {})
+    assert data_service.build_embeddings(context)["indexed_count"] == 25
+    assert sizes == [10, 10, 5]
+    data_service.build_embeddings(context)
+    assert sizes == [10, 10, 5]
+
+    settings.embedding_batch_size = 7
+    data_service.build_embeddings(context)
+    assert sizes == [10, 10, 5]  # Existing vectors are reused, while new checkpoint boundaries are recorded.
+    assert db_session.scalar(select(func.count(RunStep.id)).where(RunStep.run_id == context.run_id)) == 7
+
+    settings.embedding_model = "another-model"
+    settings.embedding_batch_size = 10
+    data_service.build_embeddings(context)
+    assert sizes == [10, 10, 5, 10, 10, 5]
+    assert db_session.scalar(select(func.count(PatentEmbedding.id))) == 50

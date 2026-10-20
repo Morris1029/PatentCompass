@@ -28,13 +28,23 @@ class DatasetBinding(RequestModel):
 class MessageReference(RequestModel):
     report_version_id: UUID
     block_id: str | None = None
+    block_ids: list[str] = Field(default_factory=list, max_length=100)
     text: str = Field(default="", max_length=20000)
 
 
 class MessageCreate(RequestModel):
-    content: str = Field(min_length=1, max_length=40000)
+    content: str = Field(default="", max_length=40000)
     reference: MessageReference | None = None
-    action: Literal["chat", "analyze", "generate_report"] = "chat"
+    action: Literal["chat", "analyze", "generate_report", "auto"] = "chat"
+    attachments: list[UUID] = Field(default_factory=list, max_length=10)
+    report_mode: Literal["statistical", "ai"] = "statistical"
+    semantic_mode: Literal["off", "full"] = "off"
+
+    @model_validator(mode="after")
+    def meaningful(self):
+        if not self.content and not self.attachments:
+            raise ValueError("请输入文字或添加资料")
+        return self
 
 
 class ConversationCreate(RequestModel):
@@ -45,26 +55,77 @@ class RunCreate(RequestModel):
     action: Literal["analyze", "generate_report", "index"]
     analysis_id: UUID | None = None
     report_mode: Literal["statistical", "ai"] = "statistical"
+    semantic_mode: Literal["off", "full"] = "off"
 
 
 class RunInput(RequestModel):
     input_request_id: UUID
-    expected_scope_version_id: UUID
+    expected_scope_version_id: UUID | None = None
     values: dict[str, Any]
+
+
+class ReportOperation(RequestModel):
+    op: Literal["set_title", "replace_text", "insert_block", "remove_block", "move_block", "append_roadmap", "insert_chart", "update_chart", "set_layout", "set_chart_layout"]
+    block_id: str | None = None
+    text: str | None = Field(default=None, max_length=40000)
+    block: dict[str, Any] | None = None
+    after_id: str | None = None
+    chart_id: UUID | None = None
+    chart_version_id: UUID | None = None
+    layout: dict[str, Any] | None = None
 
 
 class ReportRevision(RequestModel):
     base_version_id: UUID
     expected_current_version_id: UUID
-    block_id: str = Field(min_length=1)
+    block_id: str | None = Field(default=None, min_length=1)
     replacement_text: str | None = Field(default=None, max_length=40000)
     instruction: str | None = Field(default=None, min_length=1, max_length=10000)
+    operations: list[ReportOperation] | None = Field(default=None, min_length=1, max_length=100)
+    conversation_id: UUID | None = None
 
     @model_validator(mode="after")
     def one_edit(self):
+        if self.operations is not None:
+            if self.block_id or self.replacement_text is not None or self.instruction:
+                raise ValueError("operations 与旧单块修改形式互斥")
+            return self
+        if not self.block_id:
+            raise ValueError("单块修改需要 block_id")
         if (self.replacement_text is None) == (self.instruction is None):
             raise ValueError("replacement_text 与 instruction 必须且只能提供一项")
         return self
+
+
+class ChartRevision(RequestModel):
+    base_version_id: UUID
+    expected_current_version_id: UUID
+    mode: Literal["style", "data", "insight"]
+    option: dict[str, Any] = Field(default_factory=dict)
+    filters: dict[str, Any] = Field(default_factory=dict)
+    instruction: str = Field(default="", max_length=10000)
+
+
+class ClassificationCorrection(RequestModel):
+    application_id: UUID
+    dimension: Literal["elements", "methods", "scenarios"]
+    theme_ids: list[str] = Field(max_length=20)
+
+
+class AnalysisRevision(RequestModel):
+    base_analysis_id: UUID
+    expected_current_analysis_id: UUID
+    corrections: list[ClassificationCorrection] = Field(min_length=1, max_length=5200)
+
+
+class MaterialResponse(BaseModel):
+    model_config = ConfigDict(extra="allow", from_attributes=True)
+    id: UUID
+    project_id: UUID
+    file_id: UUID
+    status: str
+    run_id: UUID | None
+    version: int
 
 
 class CurrentVersionUpdate(RequestModel):
@@ -111,6 +172,9 @@ class QualityResponse(BaseModel):
     quality: dict[str, Any]
     source_metadata: dict[str, Any]
     source_file_id: UUID
+    base_version_id: UUID | None = None
+    conflicts: list[dict[str, Any]] = Field(default_factory=list)
+    sources: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class RunResponse(Resource):
@@ -122,6 +186,9 @@ class RunResponse(Resource):
     input_request: dict[str, Any] | None
     dataset_version_ids: list[str]
     scope_version_id: UUID | None
+    origin_message_id: UUID | None = None
+    activities: list[dict[str, Any]] = Field(default_factory=list)
+    stream: dict[str, Any] | None = None
 
 
 class TaskResponse(BaseModel):
@@ -141,6 +208,8 @@ class MessageResponse(Resource):
     role: str
     content: str
     reference: dict[str, Any] | None
+    attachments: list[str] = Field(default_factory=list)
+    cards: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class PatentResponse(Resource):
@@ -188,6 +257,13 @@ class ReportVersionResponse(Resource):
     summary: str
 
 
+class ReportVersionSummary(Resource):
+    number: int
+    parent_id: UUID | None
+    summary: str
+    is_current: bool
+
+
 class AdoptedVersionResponse(BaseModel):
     report_id: UUID
     current_version_id: UUID
@@ -218,6 +294,14 @@ class PatentPage(Page[PatentResponse]):
 
 class ReportVersionPage(Page[ReportVersionResponse]):
     current_version_id: UUID | None
+
+
+class ReportVersionSummaryPage(Page[ReportVersionSummary]):
+    current_version_id: UUID | None
+
+
+class ChartVersionPage(Page[ChartResponse]):
+    current_version_id: UUID
 
 
 class HealthResponse(BaseModel):

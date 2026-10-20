@@ -4,6 +4,8 @@ from pathlib import Path
 
 import pytest
 from sqlalchemy import create_engine, text
+from alembic import command
+from alembic.config import Config
 from sqlalchemy.engine import make_url
 from sqlalchemy.orm import sessionmaker
 
@@ -11,6 +13,30 @@ from app import db
 from app.config import get_settings
 from app.jobs import RunContext
 from app.models import Base, Project, ResearchRun, ScopeVersion, new_id, utcnow
+
+
+@pytest.fixture(autouse=True)
+def disable_live_models(monkeypatch):
+    # Local .env may contain real credentials. Unit tests opt in only to controlled doubles.
+    settings = get_settings()
+    monkeypatch.setattr(settings, "llm_extra_body", {})
+    for prefix in ("llm", "embedding"):
+        for suffix in ("base_url", "api_key", "model"):
+            monkeypatch.setattr(settings, f"{prefix}_{suffix}", "")
+
+
+@pytest.fixture
+def buffered_chat_stream(monkeypatch):
+    # Existing evidence/routing tests use controlled complete-message doubles.
+    from app import model_provider
+
+    def stream(messages, tools=None, on_delta=None):
+        response = model_provider.chat(messages, tools=tools)
+        if on_delta and response.get("content"):
+            on_delta(response["content"])
+        return response
+
+    monkeypatch.setattr(model_provider, "stream_chat", stream)
 
 
 @pytest.fixture(scope="session")
@@ -25,8 +51,12 @@ def test_engine():
     admin.dispose()
     engine = create_engine(url, pool_pre_ping=True)
     with engine.begin() as connection:
-        connection.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
-        Base.metadata.create_all(connection)
+        config = Config(str(Path(__file__).resolve().parents[1] / "alembic.ini"))
+        config.set_main_option("script_location", str(Path(__file__).resolve().parents[1] / "migrations"))
+        config.attributes["connection"] = connection
+        if connection.scalar(text("SELECT to_regclass('projects')")) and not connection.scalar(text("SELECT to_regclass('alembic_version')")):
+            command.stamp(config, "6aac1e9591cf")
+        command.upgrade(config, "head")
     yield engine
     engine.dispose()
 

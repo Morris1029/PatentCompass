@@ -232,6 +232,7 @@ def test_failed_handler_stores_error_and_does_not_claim_success(db_session, proj
 
 
 def _chat_context(db_session, project, context_factory, content):
+    from app.conversation_execution import execution_context
     conversation = Conversation(project_id=project.id, title=content)
     db_session.add(conversation)
     db_session.flush()
@@ -242,13 +243,16 @@ def _chat_context(db_session, project, context_factory, content):
     run = db_session.get(ResearchRun, context.run_id)
     run.conversation_id = conversation.id
     message.run_id = run.id
+    run.payload = {**run.payload, "execution_authorization": {
+        "context": execution_context(db_session, run), "allowed_actions": ["search_patents", "search_materials"]}}
     db_session.flush()
+    context.payload = dict(run.payload)
     context.conversation_id = conversation.id
     return context, message
 
 
 @pytest.fixture
-def configured_chat(monkeypatch):
+def configured_chat(monkeypatch, buffered_chat_stream):
     settings = get_settings()
     monkeypatch.setattr(settings, "llm_base_url", "https://controlled.invalid/v1")
     monkeypatch.setattr(settings, "llm_api_key", "test")
@@ -354,6 +358,9 @@ def test_historical_report_chat_freezes_scope_data_and_analysis(db_session, proj
     assert run.scope_version_id == old_scope and run.dataset_version_ids == [old_dataset]
     assert run.payload["analysis_id"] == analysis.id and run.payload["reference_version_id"] == version.id
     run.status, run.lease_token, run.lease_expires_at = "running", new_id(), utcnow() + timedelta(hours=1)
+    from app.conversation_execution import execution_context
+    run.payload = {**run.payload, "execution_authorization": {
+        "context": execution_context(db_session, run), "allowed_actions": ["search_patents", "search_materials"]}}
     db_session.flush()
     context = jobs.RunContext(run.id, run.lease_token)
     calls = []
@@ -376,3 +383,51 @@ def test_historical_report_chat_freezes_scope_data_and_analysis(db_session, proj
                       "mode": "keywords", "application_ids": analysis.patent_ids}]
     db_session.expire_all()
     assert db_session.get(Message, result["message_id"]).reference["report_version_id"] == version.id
+
+
+def test_chat_synonym_queries_union_records_and_keep_per_query_counts(db_session, project, context_factory,
+                                                                    monkeypatch, configured_chat):
+    from app import model_provider
+    context, _ = _chat_context(db_session, project, context_factory, "检索自主降落")
+    record = SimpleNamespace(id=new_id(), application_number="PCT/CONTROLLED/2", title="Autonomous landing",
+        abstract="An autonomous landing method.", source_sheet="Patents", source_row=2, dataset_version_id=new_id())
+    queries, outputs = [], []
+
+    def search(session, supplied_project, filters):
+        queries.append(filters["q"])
+        return {"items": [record], "scope_application_count": 520}
+
+    def model(prompt, tools=None):
+        if not outputs:
+            outputs.append("searched")
+            return {"content": None, "tool_calls": [{"id": "union", "type": "function", "function": {
+                "name": "search_patents", "arguments": '{"queries":["autonomous landing","landing"]}'}}]}
+        result = json.loads(prompt[-1]["content"])
+        assert result["matched_count"] == 1
+        assert len(result["query_counts"]) == 2 and len(result["records"]) == 1
+        return {"content": "两式并集共1条申请，依据为PCT/CONTROLLED/2原文。"}
+
+    monkeypatch.setattr(data_service, "search_patents", search)
+    monkeypatch.setattr(model_provider, "chat", model)
+    jobs._chat(context)
+    assert queries == ["autonomous landing", "landing"]
+
+
+def test_chat_final_turn_closes_tools_and_answers_from_observed_evidence(db_session, project, context_factory,
+                                                                      monkeypatch, configured_chat):
+    from app import model_provider
+    context, _ = _chat_context(db_session, project, context_factory, "检索并说明证据边界")
+    turns = []
+
+    def model(prompt, tools=None):
+        turns.append(tools)
+        if len(turns) < 4:
+            return {"content": None, "tool_calls": [{"id": f"call-{len(turns)}", "type": "function", "function": {
+                "name": "search_patents", "arguments": '{"q":"landing"}'}}]}
+        assert tools is None and "预算已用完" in prompt[-1]["content"]
+        return {"content": "目前检索未取得证据，不能据此证明技术不存在。"}
+
+    monkeypatch.setattr(data_service, "search_patents", lambda *args: {"items": [], "scope_application_count": 520})
+    monkeypatch.setattr(model_provider, "chat", model)
+    result = jobs._chat(context)
+    assert len(turns) == 4 and result["message_id"]

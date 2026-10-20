@@ -72,7 +72,8 @@ class DatasetVersion(Record, Base):
     status: Mapped[str] = mapped_column(String(30), default="pending")
     quality: Mapped[dict] = mapped_column(JSONB, default=dict)
     source_metadata: Mapped[dict] = mapped_column(JSONB, default=dict)
-    __table_args__ = (UniqueConstraint("dataset_id", "rule_version"),)
+    base_version_id: Mapped[str | None] = mapped_column(ForeignKey("dataset_versions.id"), index=True)
+    merge_fingerprint: Mapped[str | None] = mapped_column(String(64), unique=True)
 
 
 class PatentApplication(Record, Base):
@@ -126,6 +127,8 @@ class Message(Record, Base):
     role: Mapped[str] = mapped_column(String(30))
     content: Mapped[str] = mapped_column(Text)
     reference: Mapped[dict | None] = mapped_column(JSONB)
+    attachments: Mapped[list] = mapped_column(JSONB, default=list)
+    cards: Mapped[list] = mapped_column(JSONB, default=list)
 
 
 class ResearchRun(Record, Base):
@@ -193,6 +196,7 @@ class AnalysisResult(Record, Base):
     patent_ids: Mapped[list] = mapped_column(JSONB)
     summary: Mapped[dict] = mapped_column(JSONB, default=dict)
     views: Mapped[dict] = mapped_column(JSONB, default=dict)
+    revision_of_id: Mapped[str | None] = mapped_column(ForeignKey("analysis_results.id"), index=True)
 
 
 class Chart(Record, Base):
@@ -241,3 +245,79 @@ class ReportVersion(Record, Base):
 
 
 Index("ix_run_dispatch", ResearchRun.dispatch_pending, ResearchRun.status)
+
+
+class Material(Record, Base):
+    __tablename__ = "materials"
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id"), index=True)
+    file_id: Mapped[str] = mapped_column(ForeignKey("files.id"))
+    status: Mapped[str] = mapped_column(String(30), default="pending")
+    run_id: Mapped[str | None] = mapped_column(ForeignKey("research_runs.id"), index=True)
+    version: Mapped[int] = mapped_column(Integer, default=1)
+    error: Mapped[dict | None] = mapped_column(JSONB)
+
+
+class MaterialBlock(Record, Base):
+    __tablename__ = "material_blocks"
+    material_id: Mapped[str] = mapped_column(ForeignKey("materials.id"), index=True)
+    ordinal: Mapped[int] = mapped_column(Integer)
+    kind: Mapped[str] = mapped_column(String(30))
+    location: Mapped[dict] = mapped_column(JSONB)
+    text: Mapped[str] = mapped_column(Text)
+    text_sha256: Mapped[str] = mapped_column(String(64))
+    __table_args__ = (UniqueConstraint("material_id", "ordinal"),)
+
+
+class DatasetSource(Record, Base):
+    __tablename__ = "dataset_sources"
+    version_id: Mapped[str] = mapped_column(ForeignKey("dataset_versions.id"), index=True)
+    file_id: Mapped[str] = mapped_column(ForeignKey("files.id"))
+    base_version_id: Mapped[str | None] = mapped_column(ForeignKey("dataset_versions.id"))
+    details: Mapped[dict] = mapped_column(JSONB, default=dict)
+    __table_args__ = (UniqueConstraint("version_id", "file_id"),)
+
+
+class ImportConflict(Record, Base):
+    __tablename__ = "import_conflicts"
+    version_id: Mapped[str] = mapped_column(ForeignKey("dataset_versions.id"), index=True)
+    application_number: Mapped[str] = mapped_column(String(100))
+    field: Mapped[str] = mapped_column(String(100))
+    old_value: Mapped[object] = mapped_column(JSONB)
+    new_value: Mapped[object] = mapped_column(JSONB)
+    resolution: Mapped[str | None] = mapped_column(String(20))
+    chosen_value: Mapped[object | None] = mapped_column(JSONB)
+    source: Mapped[dict] = mapped_column(JSONB, default=dict)
+    __table_args__ = (UniqueConstraint("version_id", "application_number", "field"),)
+
+
+class SemanticCache(Record, Base):
+    __tablename__ = "semantic_caches"
+    cache_key: Mapped[str] = mapped_column(String(64), unique=True)
+    text_sha256: Mapped[str] = mapped_column(String(64), index=True)
+    model: Mapped[str] = mapped_column(String(200))
+    prompt_version: Mapped[str] = mapped_column(String(80))
+    schema_version: Mapped[str] = mapped_column(String(80))
+    extraction: Mapped[dict] = mapped_column(JSONB)
+
+
+class SemanticMembership(Record, Base):
+    __tablename__ = "semantic_memberships"
+    analysis_id: Mapped[str] = mapped_column(ForeignKey("analysis_results.id"), index=True)
+    application_id: Mapped[str] = mapped_column(ForeignKey("patent_applications.id"), index=True)
+    taxonomy_version: Mapped[str] = mapped_column(String(100))
+    status: Mapped[str] = mapped_column(String(30))
+    assignment: Mapped[dict] = mapped_column(JSONB)
+    __table_args__ = (UniqueConstraint("analysis_id", "application_id"),)
+
+
+class ChartVersion(Record, Base):
+    __tablename__ = "chart_versions"
+    chart_id: Mapped[str] = mapped_column(ForeignKey("charts.id"), index=True)
+    number: Mapped[int] = mapped_column(Integer)
+    option: Mapped[dict] = mapped_column(JSONB)
+    data: Mapped[dict] = mapped_column(JSONB)
+    provenance: Mapped[dict] = mapped_column(JSONB, default=dict)
+    selections: Mapped[dict] = mapped_column(JSONB, default=dict)
+    data_sha256: Mapped[str] = mapped_column(String(64))
+    interpretation: Mapped[dict] = mapped_column(JSONB, default=dict)
+    __table_args__ = (UniqueConstraint("chart_id", "number"),)

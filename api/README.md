@@ -1,6 +1,6 @@
 # PatentCompass API
 
-独立 FastAPI 后端，提供专利样本导入、项目与研究范围、对话历史、持久化任务、统计分析、图表与证据、报告版本以及 Word 导出。当前不接入前端，也不连接外部专利数据库。
+独立 FastAPI 后端，提供专利样本导入、增量合并、Word 资料、项目与研究范围、对话编排、持久化任务、统计与全量语义分析、图表历史、报告版本以及 Word 导出。`web/` 已通过同源转发接入；不连接外部专利数据库。
 
 ## 开发环境
 
@@ -9,6 +9,7 @@
 | 服务 | 运行位置 | 本机访问地址 |
 | --- | --- | --- |
 | FastAPI | `api/.venv` | `http://127.0.0.1:8000` |
+| Next.js | 本地 `web/` | `http://127.0.0.1:3000` |
 | PostgreSQL 17＋pgvector | Docker | `127.0.0.1:15432` |
 | Redis 7 | Docker | `127.0.0.1:16379` |
 | Celery worker | Linux Docker | 通过 Redis 接收任务，无 HTTP 端口 |
@@ -57,18 +58,23 @@ Swagger 为 [http://127.0.0.1:8000/docs](http://127.0.0.1:8000/docs)，完整请
 LLM_BASE_URL=https://provider.example/v1
 LLM_API_KEY=...
 LLM_MODEL=...
+LLM_EXTRA_BODY={}
 EMBEDDING_BASE_URL=https://provider.example/v1
 EMBEDDING_API_KEY=...
 EMBEDDING_MODEL=...
 ```
 
-这些地址只是格式示例；基础地址需包含提供商要求的 API 前缀，适配器分别附加 `/chat/completions` 和 `/embeddings`。默认全部留空，模型密钥不写入源码或日志。可选 `MODEL_TIMEOUT` 控制模型请求超时秒数。
+这些地址只是格式示例；基础地址需包含提供商要求的 API 前缀，适配器分别附加 `/chat/completions` 和 `/embeddings`。默认全部留空，模型密钥不写入源码或日志。可选 `MODEL_TIMEOUT` 控制模型请求超时秒数。`LLM_EXTRA_BODY` 是可选 JSON 对象，仅向聊天模型传递提供商支持的额外参数，不能覆盖消息、工具或所配置的模型；默认 `{}`。
+
+`EMBEDDING_BATCH_SIZE` 控制每次向量请求的文本数量，默认 10。应按模型服务的批次上限设置；模型或批次大小变化时使用不同检查点，已存在的相同模型向量仍复用。修改模型配置后需同时重启本地 API，并重新创建 worker 容器读取 `.env`。
 
 ## 接口与最小使用流程
 
 当前使用固定内部身份 `local-dev`，资源仍检查所属项目及引用关系。此配置适用于本机验证，尚未提供登录、组织或多租户权限体系。
 
 以下为设计中的 29 个业务操作；健康检查和文档路由另外提供。长任务返回 `202` 和 `run_id`，结果通过运行接口读取。
+
+这 29 项继续兼容；完整前端另有 7 项增量操作：项目资料上传/列表、资料详情、分析归属修订，以及图表版本列表/修订/采用。当前共 36 项业务操作，具体字段以 OpenAPI 为准。
 
 | 方法与路径 | 用途 |
 | --- | --- |
@@ -102,6 +108,24 @@ EMBEDDING_MODEL=...
 | `POST /api/reports/{id}/exports` | 指定版本导出 Word |
 | `GET /api/files/{id}` | 下载原始文件或完成产物 |
 
+| 增量方法与路径 | 用途 |
+| --- | --- |
+| `POST /api/projects/{id}/materials` | 上传 Word 并创建解析任务 |
+| `GET /api/projects/{id}/materials` | 项目资料与解析状态 |
+| `GET /api/materials/{id}` | 原文件、版本及段落/表格文本定位 |
+| `POST /api/projects/{id}/analysis/revisions` | 纠正分类归属并重新统计为新分析 |
+| `GET /api/charts/{id}/versions` | 图表不可变版本列表 |
+| `POST /api/charts/{id}/revisions` | 样式、局部筛选或模型解读 |
+| `PUT /api/charts/{id}/current-version` | 明确采用历史图表版本 |
+
+消息可使用 `action=auto`、`attachments=[material_id]`、`report_mode` 和 `semantic_mode`。旧客户端仍默认 `chat`，语义模式默认 `off`；前端采用 `auto` 并偏好完整语义模式，明确“只统计”的自然语言要求会进入统计模式。附件解析就绪后才允许发送，空文字仅在有附件时有效。受约束的计划、问题、检查点、消息和成果卡都持久化；等待输入必须使用返回的问题标识，发生并发变化时需明确重新确认。
+
+完整分析使用 `{"action":"analyze","semantic_mode":"full"}`。逐条处理所有入选申请，分别展示处理、完整归类和待复核数量；抽取、主题归并及归属缓存含原文、模型参数、提示和结构版本。统计值与主体矩阵由程序计算。材料不计入申请数。
+
+增量导入增加表单 `base_dataset_version_id`，按原申请号生成新完整快照；非空差异通过运行的 `import_conflicts` 问题逐项选择 `old/new/merge`，没有就绪前不可绑定。质量接口包含全部来源和差异。数据就绪后仍需显式采用新版本，旧报告继续读取旧数据。
+
+报告修订可使用 `operations` 列表替代原单块请求；两种形式互斥。支持标题、文字、内容插入/移除/移动、路线图、图表插入/更新、图表宽度与对齐、页面排版。整体校验后原子保存新版本；章节操作使用明确的有序块列表。图表和报告的“浏览”与“采用”独立。
+
 建议按下列顺序通过 Swagger 验证：
 
 1. 创建项目；初始范围可保存 `{"industry":"无人机","source_region":"中国","coverage":"部分检索结果"}` 作为说明。
@@ -123,17 +147,19 @@ EMBEDDING_MODEL=...
 
 范围、数据绑定和报告当前版本更新分别携带 `expected_scope_version_id`、`expected_revision`、`expected_current_version_id`；过期更新返回 `409`。报告路径中的 `{version}` 使用版本 UUID，不是数字序号。结构化修改指定 `base_version_id`、`expected_current_version_id`、`block_id` 与 `replacement_text`；自然语言修改用 `instruction` 替换 `replacement_text`，两者只能提供一项。需要可靠重试写入时携带 `Idempotency-Key`，相同键与相同请求复用原结果，避免重复提交任务。分页使用接口返回的 `next_cursor`，不自行拼接游标。SSE 使用 `after` 查询参数或 `Last-Event-ID` 请求头续读。
 
+报告版本目录可使用 `GET /api/reports/{id}/versions?summary=true`，仅返回版本元数据并在数据库中分页。浏览和比较使用 `GET /api/reports/{id}/versions/{version}?view=display`，保留版本元数据，正文仅含 `title`、`layout`、`blocks`；不传这些参数时继续返回原有完整内容。历史快照仍完整保存，比较不会创建版本或生成 Word。
+
 ## 模型与结果边界
 
 未配置模型时仍可使用：导入和质量检查、字段及关键词检索、年度/申请人/IPC 统计、原文证据、统计简报、结构化正文修改、版本切换和 Word 导出。
 
-自由对话、AI 摘要、自然语言段落修改及向量索引分别需要对应模型配置；缺失时返回明确错误。普通统计不会因模型缺失而失败。当前技术主题展示 IPC 结构；技术路线、候选机会及地域布局没有形成结论时返回 `unavailable` 和原因，不生成演示数据。
+自由对话、AI 摘要、语义分类、图表解读、自然语言修改及向量索引需要对应模型配置；缺失时返回明确错误。普通统计不会因模型缺失而失败，技术视角仍可展示 IPC 结构。完整语义模式形成可追溯主题、候选方向和阶段行动；缺少原文依据的归属保留为待复核。地域只统计实际申请人来源国家，省市、有效保护地及同族视角保留缺失原因。
 
 所有统计仅覆盖已导入且入选的申请记录。共同申请人分别全计数，多 IPC 标签分别计数，因此分类或申请人的合计可能大于申请总量。语义检索的 `returned_count` 是候选条数，不能代替总体数量。
 
-图表使用 ECharts 配置保存，导出时由 worker 的 ECharts SVG SSR＋Sharp 转成 PNG 并插入 Word。历史报告冻结正文、图表、数据版本和证据；之后更新范围或数据不会覆盖旧报告。当前只支持 `.docx`，不包含 PDF、Word 资料解析、外部补检、权利要求、完整法律状态或同族分析。
+图表使用 ECharts 配置保存，导出时由 worker 的 ECharts SVG SSR＋Sharp 转成 PNG 并插入 Word。历史报告冻结正文、图表、数据版本和证据；之后更新范围或数据不会覆盖旧报告。报告导出只支持 `.docx`；项目资料支持 `.docx` 及由 Linux worker LibreOffice 转换的 `.doc`。不包含 PDF 导出、外部补检、权利要求、完整法律状态或同族分析。
 
-本轮实施和验收记录见 [后端验收记录](../docs/plans/2026-10-19-backend-verification.md)。Word 的正文、版本及内嵌图片已验证；当前文档检查环境缺少 LibreOffice，整篇分页视觉检查仍待完成。
+前期后端记录见 [后端验收记录](../docs/plans/2026-10-19-backend-verification.md)。本轮接入与真实联调记录见 [前后端集成验收](../docs/plans/2026-10-19-frontend-integration.md)；产品 worker 已包含 LibreOffice 与中文字体，并完成指定版本 Word 的逐页检查。
 
 ## 验证与故障定位
 
@@ -145,6 +171,25 @@ uv run --frozen alembic check
 ```
 
 测试中的模型调用使用受控测试替身，不代表外部真实模型已经联调。数据库集成测试在同一 PostgreSQL 中自动创建独立的 `patentcompass_test` 数据库，并通过事务回滚隔离用例，不会清空开发业务库；可用 `TEST_DATABASE_URL` 指定测试服务连接。真实接口与 Docker worker 闭环应同时检查导入数、报告版本及下载文件。
+
+单元和集成测试会自动禁用本地 `.env` 中的模型配置，避免混入真实模型调用。要验收已配置的真实服务，在项目根目录单独执行：
+
+```powershell
+uv run --project api --frozen python scripts/model-probe.py
+uv run --project api --frozen python scripts/model-smoke-test.py --timeout 600
+```
+
+第一个脚本分别请求真实对话和 Embedding 接口，记录脱敏错误、响应耗时及向量维度。第二个脚本通过本地 API 和 worker，复用已导入的 520 条样本建立向量、验证中英文语义与混合检索、工具调用与原文引用、AI 报告、自然语言修改及历史报告追问。它会创建独立验收项目并生成实际模型调用费用；结果分阶段保存在 `storage/acceptance/`，失败时保留已完成证据，不生成模拟成功结果。
+
+对于生成较慢的思考模型，可将 `.env` 中的 `MODEL_TIMEOUT` 调整为 180 秒后重新加载服务。真实验收失败时可以续验，复用已通过阶段并通过失败任务的重试接口继续，不必重新生成整份向量：
+
+```powershell
+uv run --project api --frozen python scripts/model-smoke-test.py --timeout 600 --request-timeout 210 --resume storage/acceptance/<验收标识>/result.json
+```
+
+续验会新建结果目录，保留原始失败记录；历史报告追问完成后恢复测试项目的完整样本范围。
+
+首次真实模型验收的结果、修复和内容复核边界见[真实模型验收记录](../docs/plans/2026-10-19-live-model-verification.md)。
 
 本地 API 和 worker 运行时，从项目根目录执行真实样本 HTTP 验收：
 

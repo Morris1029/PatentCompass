@@ -15,7 +15,7 @@ from app.errors import AppError
 from app.files import resolve_file
 from app.model_provider import embed
 from app.models import (AnalysisResult, Chart, DatasetVersion, Evidence, PatentApplication,
-                        PatentEmbedding, PatentPublication, Project, ScopeVersion, StoredFile, new_id)
+                        PatentEmbedding, PatentPublication, Project, ResearchRun, ScopeVersion, StoredFile, new_id)
 
 
 HEADERS = {
@@ -318,14 +318,18 @@ def _text_hash(patent) -> str:
 
 
 def build_embeddings(ctx) -> dict:
-    if not get_settings().embedding_enabled:
+    settings = get_settings()
+    if not settings.embedding_enabled:
         raise AppError(503, "MODEL_NOT_CONFIGURED", "尚未配置向量模型")
     with session_scope() as session:
         patents = list(session.scalars(select(PatentApplication).where(
             PatentApplication.dataset_version_id.in_(ctx.dataset_version_ids)).order_by(PatentApplication.id)))
-    model = get_settings().embedding_model
-    for offset in range(0, len(patents), 32):
-        batch = patents[offset:offset + 32]
+    model = settings.embedding_model
+    batch_size = settings.embedding_batch_size
+    # Checkpoints must not be reused for different model or batch boundaries.
+    model_key = hashlib.sha256(model.encode()).hexdigest()[:12]
+    for offset in range(0, len(patents), batch_size):
+        batch = patents[offset:offset + batch_size]
 
         def persist():
             with session_scope() as session:
@@ -340,7 +344,7 @@ def build_embeddings(ctx) -> dict:
             return {"count": len(batch), "model": model}
 
         ctx.check_cancelled()
-        ctx.step(f"embedding_batch_{offset}", persist)
+        ctx.step(f"embedding_batch_{model_key}_{batch_size}_{offset}", persist)
     return {"indexed_count": len(patents), "model": model, "dataset_version_ids": ctx.dataset_version_ids}
 
 
@@ -369,34 +373,40 @@ def analyze(ctx) -> dict:
             publication_map = defaultdict(list)
             for publication in publications:
                 publication_map[publication.application_id].append(publication.publication_number)
-            years, applicants, ipc = defaultdict(list), defaultdict(list), defaultdict(list)
+            years, applicants, ipc, countries = defaultdict(list), defaultdict(list), defaultdict(list), defaultdict(list)
             for patent in patents:
                 years[str(patent.application_date.year)].append(patent.id)
                 for name in dict.fromkeys(patent.applicants):
                     applicants[name].append(patent.id)
                 for code in dict.fromkeys(patent.ipc_codes):
                     ipc[code].append(patent.id)
+                for country in dict.fromkeys(patent.countries):
+                    countries[country].append(patent.id)
             yearly = [{"year": int(year), "count": len(ids)} for year, ids in sorted(years.items())]
             applicant_rows = [{"name": name, "count": len(ids)} for name, ids in sorted(applicants.items(), key=lambda pair: (-len(pair[1]), pair[0]))]
             ipc_rows = [{"code": code, "count": len(ids)} for code, ids in sorted(ipc.items(), key=lambda pair: (-len(pair[1]), pair[0]))]
+            country_rows = [{"country": country, "count": len(ids)} for country, ids in
+                            sorted(countries.items(), key=lambda pair: (-len(pair[1]), pair[0]))]
             versions = list(session.scalars(select(DatasetVersion).where(DatasetVersion.id.in_(ctx.dataset_version_ids))))
             summary = {"application_count": len(patents), "publication_count": len(publications),
                        "abstract_count": sum(bool(p.abstract) for p in patents), "yearly": yearly, "applicants": applicant_rows,
-                       "ipc": ipc_rows, "quality": versions[0].quality if versions else {},
+                       "ipc": ipc_rows, "country": country_rows, "quality": versions[0].quality if versions else {},
                        "source_metadata": versions[0].source_metadata if versions else {}, "counting_method": COUNTING_METHOD}
             representative = [{"application_id": p.id, "application_number": p.application_number,
                                "publication_numbers": sorted(publication_map[p.id]), "title": p.title, "abstract": p.abstract,
                                "source_sheet": p.source_sheet, "source_row": p.source_row, "dataset_version_id": p.dataset_version_id}
                               for p in patents[:10]]
-            return {"summary": summary, "patent_ids": ids, "selections": {"yearly": dict(years), "applicants": dict(applicants), "ipc": dict(ipc)},
+            return {"summary": summary, "patent_ids": ids, "selections": {"yearly": dict(years), "applicants": dict(applicants), "ipc": dict(ipc), "country": dict(countries)},
                     "representative": representative}
 
-    calculated = ctx.step("calculate_statistics", calculate)
+    calculated = ctx.step("calculate_statistics_v2_country", calculate)
     ctx.check_cancelled()
 
     def persist():
         with session_scope() as session:
-            existing = session.scalar(select(AnalysisResult).where(AnalysisResult.run_id == ctx.run_id))
+            run = session.get(ResearchRun, ctx.run_id)
+            run_ids = [ctx.run_id] + ([run.retry_of_id] if run and run.retry_of_id else [])
+            existing = session.scalar(select(AnalysisResult).where(AnalysisResult.run_id.in_(run_ids)))
             if existing:
                 return _analysis_result(session, existing)
             summary = calculated["summary"]
@@ -408,7 +418,8 @@ def analyze(ctx) -> dict:
             charts, evidence_ids = {}, []
             for kind, dimension, title, key in (("yearly", "year", "年度申请分布", "year"),
                                                 ("applicants", "applicant", "主要申请人", "name"),
-                                                ("ipc", "ipc", "IPC 技术分类", "code")):
+                                                ("ipc", "ipc", "IPC 技术分类", "code"),
+                                                ("country", "country", "申请人来源国家", "country")):
                 # Summary keeps every group; the rendered ranking shows the leading 15.
                 rows = [{"value": str(row[key]), "label": str(row[key]), "count": row["count"]} for row in summary[kind]]
                 displayed = rows if kind == "yearly" else rows[:15]
@@ -438,7 +449,10 @@ def analyze(ctx) -> dict:
                 "technology": ready({"classification": "IPC", "ipc": summary["ipc"]}, ["ipc"]),
                 "opportunities": unavailable("当前仅提供确定性样本统计；候选机会需要模型分析和外部补检"),
                 "roadmap": unavailable("当前样本缺少权利要求与法律状态，尚未执行语义路线分析"),
-                "geography": unavailable("现有国家字段不足以生成完整地域布局分析"),
+                "geography": ready({"country": summary["country"],
+                    "counting_method": "共同来源国家全计数，统计申请人来源，不等于保护地",
+                    "unavailable": {"province": "样本没有省市或详细地址", "protection": "缺少有效保护地及法律状态",
+                                    "family": "没有完整同族数据"}}, ["country"]),
             }
             project = session.scalar(select(Project).where(Project.id == ctx.project_id).with_for_update())
             if project.scope_version_id == ctx.scope_version_id and ctx.dataset_version_ids == [project.dataset_version_id]:

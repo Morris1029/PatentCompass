@@ -74,7 +74,7 @@ def test_all_29_business_operations_have_openapi_contracts(client):
     document = client.get("/openapi.json").json()
     operations = [(path, method, operation) for path, methods in document["paths"].items() if path.startswith("/api/")
                   for method, operation in methods.items()]
-    assert len(operations) == 29
+    assert len(operations) == 36
     for path, method, operation in operations:
         assert "responses" in operation, (method, path)
         assert "422" in operation["responses"], (method, path)
@@ -133,6 +133,11 @@ def test_api_research_report_and_version_contract(client, api_dataset):
     conversation = client.post(f"/api/projects/{project_id}/conversations", json={"initial_message": {"content": "分析当前样本", "action": "analyze"}})
     assert conversation.status_code == 202, conversation.text
     conversation = conversation.json()
+    execute_run(conversation["run_id"])
+    waiting = client.get(f"/api/runs/{conversation['run_id']}").json()
+    assert waiting["input_request"]["kind"] == "execution_confirmation"
+    assert client.post(f"/api/runs/{conversation['run_id']}/inputs", json={
+        "input_request_id": waiting["input_request"]["id"], "values": {"confirmed": True}}).status_code == 202
     execute_run(conversation["run_id"])
     status = client.get(f"/api/runs/{conversation['run_id']}").json()
     assert status["status"] == "succeeded", status
