@@ -15,12 +15,14 @@ class ProjectCreate(RequestModel):
 
 
 class ScopeUpdate(RequestModel):
+    research_id: UUID | None = None
     expected_scope_version_id: UUID
     changes: dict[str, Any] = Field(default_factory=dict)
     confirmed: bool = False
 
 
 class DatasetBinding(RequestModel):
+    research_id: UUID | None = None
     expected_revision: int = Field(ge=0)
     dataset_version_ids: list[UUID] = Field(min_length=1, max_length=1)
 
@@ -33,6 +35,7 @@ class MessageReference(RequestModel):
 
 
 class MessageCreate(RequestModel):
+    research_id: UUID | None = None
     content: str = Field(default="", max_length=40000)
     reference: MessageReference | None = None
     action: Literal["chat", "analyze", "generate_report", "auto"] = "chat"
@@ -52,6 +55,7 @@ class ConversationCreate(RequestModel):
 
 
 class RunCreate(RequestModel):
+    research_id: UUID | None = None
     action: Literal["analyze", "generate_report", "index"]
     analysis_id: UUID | None = None
     report_mode: Literal["statistical", "ai"] = "statistical"
@@ -76,6 +80,7 @@ class ReportOperation(RequestModel):
 
 
 class ReportRevision(RequestModel):
+    research_id: UUID | None = None
     base_version_id: UUID
     expected_current_version_id: UUID
     block_id: str | None = Field(default=None, min_length=1)
@@ -98,6 +103,7 @@ class ReportRevision(RequestModel):
 
 
 class ChartRevision(RequestModel):
+    research_id: UUID | None = None
     base_version_id: UUID
     expected_current_version_id: UUID
     mode: Literal["style", "data", "insight"]
@@ -113,6 +119,7 @@ class ClassificationCorrection(RequestModel):
 
 
 class AnalysisRevision(RequestModel):
+    research_id: UUID | None = None
     base_analysis_id: UUID
     expected_current_analysis_id: UUID
     corrections: list[ClassificationCorrection] = Field(min_length=1, max_length=5200)
@@ -131,6 +138,20 @@ class MaterialResponse(BaseModel):
 class CurrentVersionUpdate(RequestModel):
     version_id: UUID
     expected_current_version_id: UUID
+
+
+class ResearchCreate(RequestModel):
+    base_revision_id: UUID
+
+
+class ResearchAdopt(RequestModel):
+    expected_current_version_id: UUID
+
+
+class ResearchRestore(RequestModel):
+    revision_id: UUID
+    expected_current_version_id: UUID
+    expected_adopted_version_id: UUID
 
 
 class ReportExport(RequestModel):
@@ -245,6 +266,15 @@ class AnalysisResponse(BaseModel):
 
 
 class ReportVersionResponse(Resource):
+    research_id: UUID | None = None
+    research_number: int | None = None
+    main_conversation_id: UUID | None = None
+    source_conversation_id: UUID | None = None
+    source_message_id: UUID | None = None
+    change_kind: str = "edit"
+    change_count: int = 0
+    change_summary: dict[str, Any] = Field(default_factory=dict)
+    restored_from_id: UUID | None = None
     report_id: UUID
     number: int
     parent_id: UUID | None
@@ -258,6 +288,15 @@ class ReportVersionResponse(Resource):
 
 
 class ReportVersionSummary(Resource):
+    research_id: UUID | None = None
+    research_number: int | None = None
+    main_conversation_id: UUID | None = None
+    source_conversation_id: UUID | None = None
+    source_message_id: UUID | None = None
+    change_kind: str = "edit"
+    change_count: int = 0
+    change_summary: dict[str, Any] = Field(default_factory=dict)
+    restored_from_id: UUID | None = None
     number: int
     parent_id: UUID | None
     summary: str

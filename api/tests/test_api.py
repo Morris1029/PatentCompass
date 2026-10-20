@@ -74,7 +74,7 @@ def test_all_29_business_operations_have_openapi_contracts(client):
     document = client.get("/openapi.json").json()
     operations = [(path, method, operation) for path, methods in document["paths"].items() if path.startswith("/api/")
                   for method, operation in methods.items()]
-    assert len(operations) == 36
+    assert len(operations) == 44
     for path, method, operation in operations:
         assert "responses" in operation, (method, path)
         assert "422" in operation["responses"], (method, path)
@@ -173,8 +173,18 @@ def test_api_research_report_and_version_contract(client, api_dataset):
     assert len(versions["items"]) == 2
     assert versions["current_version_id"] == new_version_id
     assert client.get(f"/api/reports/{report_id}/versions/{version_id}").json()["content"] == original["content"]
-    adopted = client.put(f"/api/reports/{report_id}/current-version", json={"version_id": version_id, "expected_current_version_id": new_version_id})
-    assert adopted.status_code == 200
+    historical = client.put(f"/api/reports/{report_id}/current-version", json={"version_id": version_id, "expected_current_version_id": new_version_id})
+    assert historical.status_code == 409 and historical.json()["code"] == "RESTORE_REQUIRED"
+    restored_task = client.post(f"/api/research-versions/{revised['result']['research_id']}/restore", json={
+        "revision_id": version_id, "expected_current_version_id": new_version_id,
+        "expected_adopted_version_id": new_version_id})
+    assert restored_task.status_code == 202, restored_task.text
+    execute_run(restored_task.json()["run_id"])
+    restored_run = client.get(f"/api/runs/{restored_task.json()['run_id']}").json()
+    assert restored_run["status"] == "succeeded", restored_run
+    restored_id = restored_run["result"]["report_version_id"]
+    assert restored_id != version_id
+    assert client.get(f"/api/reports/{report_id}/versions/{restored_id}").json()["content"] == original["content"]
     stale = client.put(f"/api/reports/{report_id}/current-version", json={"version_id": new_version_id, "expected_current_version_id": new_version_id})
     assert stale.status_code == 409
     export = client.post(f"/api/reports/{report_id}/exports", json={"report_version_id": version_id, "format": "docx"})
@@ -184,7 +194,7 @@ def test_api_research_report_and_version_contract(client, api_dataset):
     source = client.get(f"/api/files/{imported['source_file_id']}")
     assert source.status_code == 200 and source.content.startswith(b"PK")
     restored = client.get(f"/api/projects/{project_id}").json()
-    assert restored["current_report_version_id"] == version_id and restored["last_conversation_id"] == conversation["conversation_id"]
+    assert restored["current_report_version_id"] == restored_id and restored["last_conversation_id"] == conversation["conversation_id"]
 
 
 def test_idempotency_pagination_and_scope_conflicts(client, db_session):

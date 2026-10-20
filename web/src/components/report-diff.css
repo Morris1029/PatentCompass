@@ -20,6 +20,11 @@
 .comparison-eyebrow { color: #789094; font-size: 11px; }
 .comparison-heading h2 { font-size: 20px; font-weight: 600; margin-top: 4px; }
 .comparison-heading h2 > span { margin: 0 8px; color: #9aadb2; font-weight: 400; }
+.comparison-record-summaries { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; margin: 17px 0; }
+.comparison-record-summaries > div { min-width: 0; padding: 11px 13px; border-left: 2px solid #c9dfda; background: #f7fafa; }
+.comparison-record-summaries span { color: #607b86; font-size: 11px; }
+.comparison-record-summaries p { margin: 5px 0 0; font-size: 13px; overflow-wrap: anywhere; }
+@media (max-width: 720px) { .comparison-record-summaries { grid-template-columns: 1fr; gap: 8px; } }
 .comparison-view-switch { display: inline-flex; padding: 3px; border: 1px solid #d9e4e6; border-radius: 7px; background: #f5f8f8; }
 .comparison-view-switch button { padding: 6px 11px; border: 0; border-radius: 4px; font-size: 12px; color: #72868e; background: transparent; }
 .comparison-view-switch button[aria-pressed="true"] { color: #267464; background: #fff; box-shadow: 0 1px 5px #20334412; }

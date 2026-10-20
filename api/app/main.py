@@ -23,7 +23,7 @@ from app.files import resolve_file, store_bytes
 from app.jobs import TERMINAL, create_run, dispatch_pending, emit_event
 from app.models import (AnalysisResult, Chart, Conversation, Dataset, DatasetVersion, Evidence,
                         IdempotencyRequest, Message, PatentApplication, PatentPublication, Project,
-                        Report, ReportVersion, ResearchRun, RunEvent, RunStep, ScopeVersion, StoredFile,
+                        Report, ReportVersion, ResearchVersion, ResearchRun, RunEvent, RunStep, ScopeVersion, StoredFile,
                         ChartVersion, DatasetSource, ImportConflict, Material, MaterialBlock, new_id, utcnow)
 
 logger = logging.getLogger(__name__)
@@ -57,7 +57,7 @@ def owned(session, model, object_id, lock=False):
         permitted = row.owner_id == get_settings().dev_owner_id
     elif isinstance(row, DatasetVersion):
         permitted = session.get(Dataset, row.dataset_id).owner_id == get_settings().dev_owner_id
-    elif isinstance(row, ReportVersion):
+    elif isinstance(row, (ReportVersion, ResearchVersion)):
         permitted = session.get(Project, session.get(Report, row.report_id).project_id).owner_id == get_settings().dev_owner_id
     elif isinstance(row, Message):
         permitted = session.get(Project, session.get(Conversation, row.conversation_id).project_id).owner_id == get_settings().dev_owner_id
@@ -168,16 +168,53 @@ def validate_scope(content):
     return content
 
 
-def update_scope(session, project, expected_id, changes, confirmed):
-    if project.scope_version_id != str(expected_id):
+def research_for(session, project, research_id):
+    if not research_id:
+        return None
+    research = owned(session, ResearchVersion, research_id, lock=True)
+    if session.get(Report, research.report_id).project_id != project.id:
+        raise AppError(404, "RESEARCH_NOT_FOUND", "研究版本不属于此项目")
+    return research
+
+
+def research_record(session, research):
+    from app.research_service import context_for
+    context = context_for(session, research)
+    scope = session.get(ScopeVersion, context.get("scope_version_id")) if context.get("scope_version_id") else None
+    head = session.execute(select(ReportVersion.content["title"].label("title"), ReportVersion.created_at)
+                           .where(ReportVersion.id == research.current_revision_id)).first() if research.current_revision_id else None
+    return {**record(research), "current_version_id": research.current_revision_id,
+            "title": head.title if head else "新一轮研究", "updated_at": head.created_at if head else research.created_at,
+            "context": {**context, "scope": record(scope) if scope else None,
+                        "dataset_version_id": next(iter(context.get("dataset_version_ids", [])), None),
+                        "current_analysis_id": context.get("analysis_id"), "revision": research.revision}}
+
+
+def revision_metadata(session, value):
+    result = dict(value)
+    research = session.get(ResearchVersion, result.get("research_id")) if result.get("research_id") else None
+    source = session.get(Message, result.get("source_message_id")) if result.get("source_message_id") else None
+    return {**result, "research_number": research.number if research else None,
+            "main_conversation_id": research.main_conversation_id if research else None,
+            "source_conversation_id": source.conversation_id if source else result.get("conversation_id")}
+
+
+def update_scope(session, project, expected_id, changes, confirmed, research=None):
+    current_id = research.scope_version_id if research else project.scope_version_id
+    if current_id != str(expected_id):
         raise AppError(409, "SCOPE_VERSION_CONFLICT", "范围已被更新，请刷新后重试")
-    old = session.get(ScopeVersion, project.scope_version_id)
+    old = session.get(ScopeVersion, current_id)
     content = validate_scope({**old.content, **changes})
-    scope = ScopeVersion(project_id=project.id, number=old.number + 1, content=content, confirmed=confirmed)
+    number = session.scalar(select(func.max(ScopeVersion.number)).where(ScopeVersion.project_id == project.id)) or 0
+    scope = ScopeVersion(project_id=project.id, number=number + 1, content=content, confirmed=confirmed)
     session.add(scope)
     session.flush()
-    project.scope_version_id = scope.id
-    project.revision += 1
+    if research:
+        from app.research_service import set_context
+        set_context(session, research, scope_id=scope.id, analysis_id=None)
+    else:
+        project.scope_version_id = scope.id
+        project.revision += 1
     return scope
 
 
@@ -211,20 +248,32 @@ def make_message(session, project, conversation, message):
             raise AppError(404, "MATERIAL_NOT_FOUND", "资料不属于此项目")
         if material.status != "ready":
             raise AppError(409, "MATERIAL_NOT_READY", "请等待附件解析完成后发送", {"material_id": material.id})
-    if message.action in {"analyze", "generate_report"} and not project.dataset_version_id:
+    from app.research_service import for_conversation, ensure_for_report
+    research = research_for(session, project, message.research_id) if message.research_id else for_conversation(session, conversation.id)
+    if message.reference:
+        cited = session.get(ReportVersion, str(message.reference.report_version_id))
+        report = session.get(Report, cited.report_id)
+        ensure_for_report(session, report)
+        research = session.get(ResearchVersion, cited.research_id)
+    if message.action in {"analyze", "generate_report"} and not (research.dataset_version_ids if research else project.dataset_version_id):
         raise AppError(409, "DATASET_REQUIRED", "请先绑定就绪的数据版本")
     row = Message(conversation_id=conversation.id, role="user", content=message.content,
                   reference=value.get("reference"), attachments=value["attachments"])
     session.add(row)
     session.flush()
     run = create_run(session, message.action, project, {"message_id": row.id, "report_mode": message.report_mode,
-                     "semantic_mode": message.semantic_mode, "attachments": value["attachments"]}, conversation.id)
-    if message.action in {"chat", "auto"} and project.current_analysis_id:
+                     "semantic_mode": message.semantic_mode, "attachments": value["attachments"],
+                     **({"research_id": research.id} if research else {})}, conversation.id)
+    if not research and message.action in {"chat", "auto"} and project.current_analysis_id:
         analysis = session.get(AnalysisResult, project.current_analysis_id)
         if analysis.scope_version_id == run.scope_version_id and analysis.dataset_version_ids == run.dataset_version_ids:
             run.payload = {**run.payload, "analysis_id": analysis.id}
-    if message.reference:
-        version = session.get(ReportVersion, str(message.reference.report_version_id))
+    if message.action == "chat" and not message.reference and not run.payload.get("reference_version_id"):
+        report = session.scalar(select(Report).where(Report.project_id == project.id))
+        if report and report.current_version_id:
+            run.payload = {**run.payload, "reference_version_id": report.current_version_id}
+    if message.reference or (message.action == "chat" and run.payload.get("reference_version_id")):
+        version = session.get(ReportVersion, str(message.reference.report_version_id) if message.reference else run.payload["reference_version_id"])
         run.scope_version_id, run.dataset_version_ids = version.scope_version_id, list(version.dataset_version_ids)
         run.payload = {**run.payload, "reference_version_id": version.id, "analysis_id": version.analysis_id}
     row.run_id = run.id
@@ -342,6 +391,7 @@ def create_app(start_dispatcher=True):
                 "dataset_version_ids": [project.dataset_version_id] if project.dataset_version_id else [],
                 "report_id": report.id if report else None,
                 "current_report_version_id": report.current_version_id if report else None,
+                "current_research_id": report.current_research_id if report else None,
                 "active_runs": [{"id": item.id, "kind": item.kind, "status": item.status} for item in active],
                 "last_conversation_id": last.id if last else None}
 
@@ -349,8 +399,9 @@ def create_app(start_dispatcher=True):
     def scope_update(id: UUID, body: schemas.ScopeUpdate, request: Request, response: Response, session: DB):
         def action():
             project = owned(session, Project, id, lock=True)
-            scope = update_scope(session, project, body.expected_scope_version_id, body.changes, body.confirmed)
-            return {**record(scope), "project_revision": project.revision,
+            research = research_for(session, project, body.research_id)
+            scope = update_scope(session, project, body.expected_scope_version_id, body.changes, body.confirmed, research)
+            return {**record(scope), "project_revision": research.revision if research else project.revision,
                     "analysis_status": "stale" if project.current_analysis_id else "not_generated"}
         return mutate(session, request, response, body.model_dump(mode="json"), action)
 
@@ -367,7 +418,9 @@ def create_app(start_dispatcher=True):
     def import_dataset(request: Request, response: Response, session: DB,
                        file: UploadFile | None = File(None), source_file_id: UUID | None = Form(None),
                        name: str = Form("无人机专利样本", min_length=1, max_length=300), source_metadata: str = Form("{}"),
-                       base_dataset_version_id: UUID | None = Form(None)):
+                       base_dataset_version_id: UUID | None = Form(None), research_id: UUID | None = Form(None)):
+        if research_id:
+            owned(session, ResearchVersion, research_id)
         if (file is None) == (source_file_id is None):
             raise AppError(422, "IMPORT_SOURCE_REQUIRED", "上传文件和 source_file_id 必须且只能提供一项")
         try:
@@ -456,11 +509,17 @@ def create_app(start_dispatcher=True):
     def bind_dataset(id: UUID, body: schemas.DatasetBinding, request: Request, response: Response, session: DB):
         def action():
             project = owned(session, Project, id, lock=True)
-            if project.revision != body.expected_revision:
+            research = research_for(session, project, body.research_id)
+            if (research.revision if research else project.revision) != body.expected_revision:
                 raise AppError(409, "PROJECT_REVISION_CONFLICT", "项目已发生变化，请刷新后重试")
             version = owned(session, DatasetVersion, body.dataset_version_ids[0])
             if version.status != "ready":
                 raise AppError(409, "DATASET_NOT_READY", "数据版本尚未通过质量检查")
+            if research:
+                from app.research_service import set_context
+                set_context(session, research, dataset_ids=[version.id], analysis_id=None)
+                return {**record(project), "revision": research.revision, "dataset_version_id": version.id,
+                        "scope_version_id": research.scope_version_id, "current_analysis_id": research.analysis_id}
             project.dataset_version_id = version.id
             project.revision += 1
             return record(project)
@@ -472,9 +531,11 @@ def create_app(start_dispatcher=True):
                 start: int | None = None, end: int | None = None, application_start: date | None = None,
                 application_end: date | None = None, mode: str = Query("field", pattern="^(field|keywords|semantic|hybrid)$"),
                 limit: int = Query(50, ge=1, le=200), cursor: str | None = None, analysis_id: UUID | None = None,
-                chart_id: UUID | None = None, chart_version_id: UUID | None = None, dimension_value: str | None = None):
+                chart_id: UUID | None = None, chart_version_id: UUID | None = None, dimension_value: str | None = None,
+                research_id: UUID | None = None):
         from app.data_service import search_patents
         project = owned(session, Project, id)
+        research = research_for(session, project, research_id)
         validate_scope({"start": start, "end": end,
                         "application_start": application_start, "application_end": application_end})
         filters = {"q": q, "applicant": applicant, "ipc": ipc, "application_number": application_number,
@@ -482,6 +543,8 @@ def create_app(start_dispatcher=True):
                    "application_start": application_start.isoformat() if application_start else None,
                    "application_end": application_end.isoformat() if application_end else None,
                    "mode": mode, "limit": limit}
+        if research:
+            filters.update(scope_version_id=research.scope_version_id, dataset_version_ids=list(research.dataset_version_ids))
         analysis = None
         if analysis_id:
             analysis = owned(session, AnalysisResult, analysis_id)
@@ -515,10 +578,13 @@ def create_app(start_dispatcher=True):
         return page
 
     @app.get("/api/projects/{id}/patents/{patent_id}", response_model=schemas.PatentResponse, tags=["patents"])
-    def patent_detail(id: UUID, patent_id: UUID, session: DB, analysis_id: UUID | None = None):
+    def patent_detail(id: UUID, patent_id: UUID, session: DB, analysis_id: UUID | None = None, research_id: UUID | None = None):
         project = owned(session, Project, id)
         application = session.get(PatentApplication, str(patent_id))
         allowed_versions = [project.dataset_version_id]
+        research = research_for(session, project, research_id)
+        if research:
+            allowed_versions = list(research.dataset_version_ids)
         if analysis_id:
             analysis = owned(session, AnalysisResult, analysis_id)
             if analysis.project_id != project.id or str(patent_id) not in analysis.patent_ids:
@@ -542,7 +608,37 @@ def create_app(start_dispatcher=True):
     @app.get("/api/projects/{id}/conversations", response_model=schemas.Page[schemas.ConversationResponse], tags=["conversations"])
     def conversations(id: UUID, session: DB, limit: int = Query(50, ge=1, le=200), cursor: str | None = None):
         project = owned(session, Project, id)
-        return paginate(session.scalars(select(Conversation).where(Conversation.project_id == project.id)).all(), limit, cursor, True)
+        result = paginate(session.scalars(select(Conversation).where(Conversation.project_id == project.id)).all(), limit, cursor, True)
+        groups = {row.main_conversation_id: row for row in session.scalars(select(ResearchVersion).join(Report, ResearchVersion.report_id == Report.id).where(Report.project_id == project.id)) if row.main_conversation_id}
+        for item in result["items"]:
+            research = groups.get(item["id"])
+            item.update(research_id=research.id if research else None, is_main=bool(research),
+                        research_number=research.number if research else None,
+                        research_status=research.status if research else None)
+        return result
+
+    @app.get("/api/conversations/{id}", tags=["conversations"])
+    def conversation_detail(id: UUID, session: DB):
+        from app.research_service import for_conversation
+        conversation = owned(session, Conversation, id)
+        research = for_conversation(session, conversation.id)
+        details = research_record(session, research) if research else None
+        return {**record(conversation), "research_id": research.id if research else None,
+                "research": details, "context": details["context"] if details else None}
+
+    @app.get("/api/conversations/{id}/messages/{message}/context", response_model=schemas.Page[schemas.MessageResponse], tags=["conversations"])
+    def message_context(id: UUID, message: UUID, session: DB, limit: int = Query(50, ge=3, le=200)):
+        conversation = owned(session, Conversation, id)
+        target = owned(session, Message, message)
+        if target.conversation_id != conversation.id:
+            raise AppError(404, "MESSAGE_NOT_FOUND", "消息不属于此对话")
+        point = (target.created_at, target.id)
+        before = session.scalars(select(Message).where(Message.conversation_id == conversation.id,
+            tuple_(Message.created_at, Message.id) <= point).order_by(Message.created_at.desc(), Message.id.desc()).limit(limit // 2 + 1)).all()
+        after = session.scalars(select(Message).where(Message.conversation_id == conversation.id,
+            tuple_(Message.created_at, Message.id) > point).order_by(Message.created_at, Message.id).limit(limit - len(before))).all()
+        items = [record(row) for row in [*reversed(before), *after]]
+        return {"items": items, "returned_count": len(items), "next_cursor": None}
 
     @app.get("/api/conversations/{id}/messages", response_model=schemas.Page[schemas.MessageResponse], tags=["conversations"])
     def messages(id: UUID, session: DB, limit: int = Query(50, ge=1, le=200), cursor: str | None = None):
@@ -560,14 +656,15 @@ def create_app(start_dispatcher=True):
     def start_run(id: UUID, body: schemas.RunCreate, request: Request, response: Response, session: DB):
         def action():
             project = owned(session, Project, id)
-            if not project.dataset_version_id:
-                raise AppError(409, "DATASET_REQUIRED", "请先绑定就绪数据")
             payload = body.model_dump(mode="json", exclude={"action"}, exclude_none=True)
             if body.analysis_id:
                 analysis = owned(session, AnalysisResult, body.analysis_id)
                 if analysis.project_id != project.id:
                     raise AppError(404, "ANALYSIS_NOT_FOUND", "分析不属于此项目")
-            return task_result(create_run(session, body.action, project, payload))
+            run = create_run(session, body.action, project, payload)
+            if not run.dataset_version_ids:
+                raise AppError(409, "DATASET_REQUIRED", "请先绑定就绪数据")
+            return task_result(run)
         return mutate(session, request, response, body.model_dump(mode="json"), action, 202)
 
     @app.get("/api/runs/{id}", response_model=schemas.RunResponse, tags=["runs"])
@@ -588,6 +685,8 @@ def create_app(start_dispatcher=True):
             input_request["scope_editable"] = (scope_editable_for_run(run)
                                                if input_request["kind"] == "execution_confirmation" else True)
         return {**record(run, exclude=("lease_token", "payload")), "steps": [record(item) for item in steps],
+                "research_id": run.payload.get("research_id"),
+                "context": research_record(session, session.get(ResearchVersion, run.payload["research_id"]))["context"] if run.payload.get("research_id") else None,
                 "input_request": input_request, "plan": run.payload.get("plan"),
                 "origin_message_id": run.payload.get("message_id") or session.scalar(select(Message.id).where(
                     Message.run_id == run.id, Message.role == "user")), "activities": activities_for_run(session, run),
@@ -632,10 +731,14 @@ def create_app(start_dispatcher=True):
         def action():
             initial = owned(session, ResearchRun, id)
             project = owned(session, Project, initial.project_id, lock=True) if initial.project_id else None
+            candidate_id = initial.payload.get("research_id") or initial.payload.get("research_proposal", {}).get("existing_research_id")
+            candidate = research_for(session, project, candidate_id) if project and candidate_id else None
+            research = candidate if initial.payload.get("research_id") else None
             run = owned(session, ResearchRun, id, lock=True)
             if run.status != "waiting_input" or not run.input_request or run.input_request["id"] != str(body.input_request_id):
                 raise AppError(409, "INPUT_REQUEST_CONFLICT", "此确认请求已经失效")
             kind = run.input_request["kind"]
+            forwarded = {}
             submitted_scope = body.values.get("scope")
             if "scope" in body.values and not isinstance(submitted_scope, dict):
                 raise AppError(422, "INVALID_SCOPE", "研究范围需要使用表格字段值")
@@ -645,44 +748,87 @@ def create_app(start_dispatcher=True):
                     raise AppError(422, "CONFIRMATION_REQUIRED", "请明确确认本轮操作")
                 if run.input_request.get("context") != execution_context(session, run):
                     run.input_request = execution_request(session, run, run.input_request["actions"], changed=True)
+                    if submitted_scope is not None:
+                        run.input_request = {**run.input_request, "scope": {**run.input_request.get("scope", {}), **submitted_scope}}
                     emit_event(session, run.id, "input.required", run.input_request)
                     return task_result(run)
-                if submitted_scope is not None:
+                destination = None
+                if run.input_request.get("research_assignment"):
+                    from app.research_service import confirm_assignment
+                    research, destination = confirm_assignment(session, run, body.values.get("research_choice"))
+                editable = scope_editable_for_run(run)
+                if submitted_scope is not None or (run.input_request.get("research_assignment") and editable):
                     existing_scope = session.get(ScopeVersion, run.scope_version_id)
-                    confirmed_scope = validate_scope({**existing_scope.content, **submitted_scope})
-                    if confirmed_scope != existing_scope.content:
-                        if not scope_editable_for_run(run):
+                    proposed = run.input_request.get("scope", {}) if run.input_request.get("research_assignment") else {}
+                    confirmed_scope = validate_scope({**existing_scope.content, **proposed, **(submitted_scope or {})})
+                    if confirmed_scope != existing_scope.content or not existing_scope.confirmed:
+                        if not editable:
                             raise AppError(409, "SCOPE_SNAPSHOT_FIXED", "此操作采用报告的固定范围，请在生成新报告时调整范围")
-                        scope = update_scope(session, project, body.expected_scope_version_id, confirmed_scope, True)
+                        expected_scope = body.expected_scope_version_id or run.scope_version_id
+                        if str(expected_scope) != run.scope_version_id:
+                            raise AppError(409, "SCOPE_VERSION_CONFLICT", "确认范围已变化，请重新核对")
+                        scope = update_scope(session, project, expected_scope, confirmed_scope, True, research)
                         run.scope_version_id = scope.id
                         run.payload = {key: value for key, value in run.payload.items()
                                        if key not in {"analysis_id", "execution_authorization"}}
+                allowed = set(run.input_request["allowed_actions"])
+                if run.payload.get("research_decision", {}).get("choice") == "new":
+                    allowed |= {"analyze", "generate_report"}
                 run.payload = {**run.payload, "execution_authorization": {
-                    "context": execution_context(session, run), "allowed_actions": run.input_request["allowed_actions"]}}
+                    "context": execution_context(session, run), "allowed_actions": sorted(allowed)}}
+                target_conversation = destination.id if destination else run.input_request.get("target_conversation_id")
+                if target_conversation and target_conversation != run.conversation_id:
+                    destination = owned(session, Conversation, target_conversation)
+                    if not research or destination.id != research.main_conversation_id or destination.project_id != project.id:
+                        raise AppError(409, "RESEARCH_CONVERSATION_CHANGED", "报告主对话已变化，请重新核对")
+                    origin = owned(session, Message, run.payload["message_id"])
+                    linked = Message(conversation_id=destination.id, run_id=run.id, role="user", content=origin.content,
+                                     reference=origin.reference, attachments=list(origin.attachments), cards=[])
+                    session.add(linked)
+                    session.flush()
+                    origin.run_id = None
+                    origin.cards = [card for card in origin.cards if card.get("type") != "task"] + [{
+                        "type": "forward", "title": "已转交报告主对话", "conversation_id": destination.id, "message_id": linked.id}]
+                    run.conversation_id = destination.id
+                    run.payload = {**run.payload, "source_message_id": origin.id, "source_conversation_id": origin.conversation_id,
+                                   "message_id": linked.id, "forwarding": {"conversation_id": destination.id, "message_id": linked.id}}
+                    run.payload = {**run.payload, "execution_authorization": {
+                        **run.payload["execution_authorization"], "context": execution_context(session, run)}}
+                    forwarded = {"conversation_id": destination.id, "message_id": linked.id, "research_id": research.id}
+                elif destination:
+                    forwarded = {"conversation_id": destination.id, "message_id": run.payload.get("message_id"), "research_id": research.id}
             elif kind == "import_conflicts":
                 from app.merge_service import resolve_conflicts
                 version = owned(session, DatasetVersion, run.payload["dataset_version_id"])
                 resolve_conflicts(session, version.id, body.values.get("choices", []))
             elif kind == "dataset_selection":
-                if project.revision != run.input_request.get("expected_project_revision", project.revision):
-                    if body.values.get("confirm_project_change") is not True or body.values.get("expected_revision") != project.revision:
+                current_revision = research.revision if research else project.revision
+                expected_revision = run.input_request.get("expected_research_revision" if research else "expected_project_revision", current_revision)
+                if current_revision != expected_revision:
+                    if body.values.get("confirm_project_change") is not True or body.values.get("expected_revision") != current_revision:
                         raise AppError(409, "PROJECT_REVISION_CONFLICT", "项目数据或范围已变化，请核对最新状态后重新确认采用数据",
-                                       {"revision": project.revision, "dataset_version_id": project.dataset_version_id})
+                                       {"revision": current_revision, "dataset_version_id": (research.dataset_version_ids or [None])[0] if research else project.dataset_version_id})
                 version = owned(session, DatasetVersion, body.values.get("dataset_version_id"))
                 if version.status != "ready":
                     raise AppError(409, "DATASET_NOT_READY", "所选数据版本尚未就绪")
-                project.dataset_version_id = version.id
-                project.revision += 1
+                if research:
+                    from app.research_service import set_context
+                    set_context(session, research, dataset_ids=[version.id], analysis_id=None)
+                else:
+                    project.dataset_version_id = version.id
+                    project.revision += 1
                 run.dataset_version_ids = [version.id]
+                run.payload = {key: value for key, value in run.payload.items() if key not in {"analysis_id", "execution_authorization"}}
             elif kind in {"scope_confirmation", "plan_confirmation"}:
                 if body.values.get("confirmed") is not True:
                     raise AppError(422, "CONFIRMATION_REQUIRED", "需要明确确认研究范围")
-                if project.scope_version_id != run.scope_version_id and body.values.get("confirm_scope_change") is not True:
+                current_scope = research.scope_version_id if research else project.scope_version_id
+                if current_scope != run.scope_version_id and body.values.get("confirm_scope_change") is not True:
                     raise AppError(409, "SCOPE_VERSION_CONFLICT", "项目范围已变化，请核对最新范围后明确重新确认",
-                                   {"scope_version_id": project.scope_version_id})
+                                   {"scope_version_id": current_scope})
                 proposed = run.input_request.get("changes", {}) if kind == "plan_confirmation" else run.input_request.get("scope", {})
                 changes = {**proposed, **(submitted_scope or {})}
-                scope = update_scope(session, project, body.expected_scope_version_id, changes, True)
+                scope = update_scope(session, project, body.expected_scope_version_id, changes, True, research)
                 run.scope_version_id = scope.id
                 if kind == "plan_confirmation":
                     run.payload = {**run.payload, "plan_confirmed": True,
@@ -696,14 +842,17 @@ def create_app(start_dispatcher=True):
                 report = owned(session, Report, version.report_id, lock=True)
                 if report.project_id != project.id:
                     raise AppError(404, "REPORT_NOT_FOUND", "报告不属于此项目")
-                if report.current_version_id != body.values.get("expected_current_version_id"):
+                target_research = session.get(ResearchVersion, version.research_id) if version.research_id else None
+                if research and (not target_research or target_research.id != research.id):
+                    raise AppError(409, "RESEARCH_TARGET_CHANGED", "请在该报告所属研究的主对话中修改")
+                target_head = target_research.current_revision_id if target_research else report.current_version_id
+                if target_head != body.values.get("expected_current_version_id") or target_head != version.id:
                     raise AppError(409, "REPORT_VERSION_CONFLICT", "采用版本已经变化，请重新选择")
                 targets = body.values.get("block_ids", [])
                 has_operations = bool(run.payload.get("plan", {}).get("operations"))
                 if not isinstance(targets, list) or (not targets and not has_operations) or any(
                     target not in {block["id"] for block in version.content["blocks"]} for target in targets):
                     raise AppError(422, "BLOCK_TARGET_REQUIRED", "请选择此版本内需要修改的正文块")
-                report.current_version_id = version.id
                 run.scope_version_id, run.dataset_version_ids = version.scope_version_id, list(version.dataset_version_ids)
                 run.payload = {**run.payload, "target_version_id": version.id, "target_current_id": version.id,
                                "target_block_ids": targets}
@@ -715,7 +864,7 @@ def create_app(start_dispatcher=True):
                 raise AppError(422, "UNKNOWN_INPUT_KIND", "不支持此确认类型")
             run.input_request, run.status, run.dispatch_pending = None, "queued", True
             emit_event(session, run.id, "step.updated", {"step": kind, "status": "succeeded"})
-            return task_result(run, scope_version_id=run.scope_version_id)
+            return task_result(run, scope_version_id=run.scope_version_id, **forwarded)
         return mutate(session, request, response, body.model_dump(mode="json"), action, 202)
 
     @app.post("/api/runs/{id}/cancel", response_model=schemas.TaskResponse, tags=["runs"])
@@ -762,9 +911,11 @@ def create_app(start_dispatcher=True):
         return mutate(session, request, response, {}, action, 202)
 
     @app.get("/api/projects/{id}/analysis", response_model=schemas.AnalysisResponse, tags=["analysis"])
-    def analysis_view(id: UUID, session: DB, run_id: UUID | None = None, view: str = "overview", analysis_id: UUID | None = None):
+    def analysis_view(id: UUID, session: DB, run_id: UUID | None = None, view: str = "overview", analysis_id: UUID | None = None,
+                      research_id: UUID | None = None):
         project = owned(session, Project, id)
-        analysis_id = str(analysis_id) if analysis_id else project.current_analysis_id
+        research = research_for(session, project, research_id)
+        analysis_id = str(analysis_id) if analysis_id else research.analysis_id if research else project.current_analysis_id
         if run_id:
             run = owned(session, ResearchRun, run_id)
             if run.project_id != project.id:
@@ -780,7 +931,7 @@ def create_app(start_dispatcher=True):
         selected = analysis.views.get(view)
         if selected is None:
             raise AppError(422, "UNKNOWN_ANALYSIS_VIEW", "不支持的分析视角", list(analysis.views))
-        stale = analysis.scope_version_id != project.scope_version_id or analysis.dataset_version_ids != [project.dataset_version_id]
+        stale = analysis.scope_version_id != (research.scope_version_id if research else project.scope_version_id) or analysis.dataset_version_ids != (research.dataset_version_ids if research else [project.dataset_version_id])
         return {"status": "stale" if stale else selected.get("status", "ready"), "analysis_id": analysis.id,
                 "run_id": analysis.run_id, "scope_version_id": analysis.scope_version_id,
                 "dataset_version_ids": analysis.dataset_version_ids, "data": selected,
@@ -796,14 +947,82 @@ def create_app(start_dispatcher=True):
     def evidence_detail(id: UUID, session: DB):
         return record(owned(session, Evidence, id))
 
+    @app.get("/api/reports/{id}/research-versions", tags=["reports"])
+    def research_versions(id: UUID, session: DB, limit: int = Query(50, ge=1, le=200), cursor: str | None = None):
+        report = owned(session, Report, id)
+        rows = session.scalars(select(ResearchVersion).where(ResearchVersion.report_id == report.id,
+                                      ResearchVersion.status == "published")).all()
+        page = paginate(rows, limit, cursor, True)
+        page["items"] = [research_record(session, session.get(ResearchVersion, item["id"])) for item in page["items"]]
+        return {**page, "current_research_id": report.current_research_id, "current_version_id": report.current_version_id}
+
+    @app.post("/api/reports/{id}/research-versions", status_code=201, tags=["reports"])
+    def new_research(id: UUID, body: schemas.ResearchCreate, request: Request, response: Response, session: DB):
+        def action():
+            from app.research_service import create_draft
+            report = owned(session, Report, id, lock=True)
+            research = create_draft(session, report, str(body.base_revision_id))
+            return {**research_record(session, research), "research_id": research.id, "conversation_id": research.main_conversation_id}
+        return mutate(session, request, response, body.model_dump(mode="json"), action, 201)
+
+    @app.get("/api/research-versions/{id}", tags=["reports"])
+    def research_detail(id: UUID, session: DB):
+        return research_record(session, owned(session, ResearchVersion, id))
+
+    @app.post("/api/research-versions/{id}/conversation", tags=["reports"])
+    def research_conversation(id: UUID, request: Request, response: Response, session: DB):
+        def action():
+            from app.research_service import ensure_conversation
+            research = owned(session, ResearchVersion, id, lock=True)
+            conversation = ensure_conversation(session, research)
+            return {"research_id": research.id, "conversation_id": conversation.id}
+        return mutate(session, request, response, {}, action)
+
+    @app.put("/api/research-versions/{id}/adopt", tags=["reports"])
+    def adopt_research(id: UUID, body: schemas.ResearchAdopt, request: Request, response: Response, session: DB):
+        def action():
+            from app.research_service import adopt
+            research = owned(session, ResearchVersion, id)
+            report = owned(session, Report, research.report_id)
+            owned(session, Project, report.project_id, lock=True)
+            report = owned(session, Report, research.report_id, lock=True)
+            research = owned(session, ResearchVersion, id, lock=True)
+            adopt(session, research, str(body.expected_current_version_id))
+            return {"research_id": research.id, "current_version_id": research.current_revision_id}
+        return mutate(session, request, response, body.model_dump(mode="json"), action)
+
+    @app.post("/api/research-versions/{id}/restore", response_model=schemas.TaskResponse, status_code=202, tags=["reports"])
+    def restore_research(id: UUID, body: schemas.ResearchRestore, request: Request, response: Response, session: DB):
+        def action():
+            research = owned(session, ResearchVersion, id)
+            report = owned(session, Report, research.report_id)
+            version = owned(session, ReportVersion, body.revision_id)
+            if version.research_id != research.id:
+                raise AppError(404, "REPORT_VERSION_NOT_FOUND", "修改记录不属于此研究版本")
+            if research.current_revision_id != str(body.expected_current_version_id) or report.current_version_id != str(body.expected_adopted_version_id):
+                raise AppError(409, "REPORT_VERSION_CONFLICT", "当前报告已变化，请重新核对后恢复")
+            run = create_run(session, "restore_report", owned(session, Project, report.project_id), {
+                "research_id": research.id, "restore_revision_id": version.id,
+                "expected_current_version_id": str(body.expected_current_version_id),
+                "expected_adopted_version_id": str(body.expected_adopted_version_id)})
+            return task_result(run)
+        return mutate(session, request, response, body.model_dump(mode="json"), action, 202)
+
     @app.get("/api/reports/{id}/versions", response_model=schemas.ReportVersionPage | schemas.ReportVersionSummaryPage,
              tags=["reports"])
     def report_versions(id: UUID, session: DB, limit: int = Query(50, ge=1, le=200), cursor: str | None = None,
-                        summary: bool = False):
+                        summary: bool = False, research_id: UUID | None = None):
         report = owned(session, Report, id)
         columns = (ReportVersion.id, ReportVersion.number, ReportVersion.parent_id,
-                   ReportVersion.created_at, ReportVersion.summary) if summary else tuple(ReportVersion.__table__.columns)
+                   ReportVersion.created_at, ReportVersion.summary, ReportVersion.research_id,
+                   ReportVersion.change_kind, ReportVersion.change_count, ReportVersion.change_summary,
+                   ReportVersion.conversation_id, ReportVersion.source_message_id, ReportVersion.restored_from_id) if summary else tuple(ReportVersion.__table__.columns)
         query = select(*columns).where(ReportVersion.report_id == report.id)
+        if research_id:
+            research = owned(session, ResearchVersion, research_id)
+            if research.report_id != report.id:
+                raise AppError(404, "RESEARCH_NOT_FOUND", "研究版本不属于此报告")
+            query = query.where(ReportVersion.research_id == research.id)
         if cursor:
             try:
                 point = json.loads(base64.urlsafe_b64decode(cursor.encode()))
@@ -816,7 +1035,7 @@ def create_app(start_dispatcher=True):
             query = query.where(tuple_(ReportVersion.created_at, ReportVersion.id) < (created_at, identifier))
         rows = session.execute(query.order_by(ReportVersion.created_at.desc(), ReportVersion.id.desc())
                                .limit(limit + 1)).mappings().all()
-        items = [dict(row) for row in rows[:limit]]
+        items = [revision_metadata(session, row) for row in rows[:limit]]
         next_cursor = None
         if len(rows) > limit:
             last = items[-1]
@@ -824,7 +1043,10 @@ def create_app(start_dispatcher=True):
                 "created_at": last["created_at"].isoformat(), "id": last["id"]}).encode()).decode()
         for item in items:
             item["is_current"] = item["id"] == report.current_version_id
-        total = session.scalar(select(func.count()).select_from(ReportVersion).where(ReportVersion.report_id == report.id))
+        count_query = select(func.count()).select_from(ReportVersion).where(ReportVersion.report_id == report.id)
+        if research_id:
+            count_query = count_query.where(ReportVersion.research_id == str(research_id))
+        total = session.scalar(count_query)
         return {"items": items, "next_cursor": next_cursor, "total": total, "returned_count": len(items),
                 "current_version_id": report.current_version_id}
 
@@ -845,11 +1067,11 @@ def create_app(start_dispatcher=True):
                 raise AppError(404, "REPORT_VERSION_NOT_FOUND", "报告版本不属于此报告")
             result = dict(row)
             result["content"] = {key: result.pop(f"display_{key}") for key in fields}
-            return result
+            return revision_metadata(session, result)
         row = owned(session, ReportVersion, version)
         if row.report_id != report.id:
             raise AppError(404, "REPORT_VERSION_NOT_FOUND", "报告版本不属于此报告")
-        return record(row)
+        return revision_metadata(session, record(row))
 
     @app.post("/api/reports/{id}/revisions", response_model=schemas.TaskResponse, status_code=202, tags=["reports"])
     def report_revision(id: UUID, body: schemas.ReportRevision, request: Request, response: Response, session: DB):
@@ -859,23 +1081,32 @@ def create_app(start_dispatcher=True):
             base = owned(session, ReportVersion, body.base_version_id)
             if base.report_id != report.id:
                 raise AppError(404, "REPORT_VERSION_NOT_FOUND", "基础版本不属于当前报告")
-            if report.current_version_id != str(body.expected_current_version_id) or report.current_version_id != base.id:
-                raise AppError(409, "REPORT_VERSION_CONFLICT", "请先切回需要修改的基础版本")
-            payload = {**body.model_dump(mode="json", exclude_none=True), "report_id": report.id}
+            from app.research_service import ensure_for_report, ensure_conversation
+            ensure_for_report(session, report)
+            research = session.get(ResearchVersion, base.research_id)
+            if body.research_id and str(body.research_id) != research.id:
+                raise AppError(404, "RESEARCH_NOT_FOUND", "基础记录不属于此研究版本")
+            if research.current_revision_id != str(body.expected_current_version_id) or research.current_revision_id != base.id:
+                raise AppError(409, "REPORT_VERSION_CONFLICT", "请使用本研究的最新内容，历史内容可通过恢复操作采用")
+            payload = {**body.model_dump(mode="json", exclude_none=True), "report_id": report.id, "research_id": research.id}
             run = create_run(session, "revise_report", project, payload)
             if body.conversation_id:
                 conversation = owned(session, Conversation, body.conversation_id)
                 if conversation.project_id != project.id:
                     raise AppError(404, "CONVERSATION_NOT_FOUND", "对话不属于此项目")
+                conversation = ensure_conversation(session, research)
                 run.conversation_id = conversation.id
                 labels = {"set_title": "修改标题", "replace_text": "修改文字", "insert_block": "添加内容",
                           "remove_block": "移除内容", "move_block": "调整顺序", "append_roadmap": "追加布局与路线图",
                           "insert_chart": "插入图表", "update_chart": "更新图表", "set_layout": "调整页面排版",
                           "set_chart_layout": "调整图表排版"}
-                session.add(Message(conversation_id=conversation.id, run_id=run.id, role="user",
+                origin = Message(conversation_id=conversation.id, run_id=run.id, role="user",
                     content=body.instruction or ("修改报告正文" if not body.operations else "更新报告：" + "、".join(labels[op.op] for op in body.operations)),
                     reference={"report_version_id": base.id, "block_id": body.block_id},
-                    cards=[{"type": "task", "run_id": run.id, "kind": "revise_report"}]))
+                    cards=[{"type": "task", "run_id": run.id, "kind": "revise_report"}])
+                session.add(origin)
+                session.flush()
+                run.payload = {**run.payload, "source_message_id": origin.id}
             run.scope_version_id, run.dataset_version_ids = base.scope_version_id, list(base.dataset_version_ids)
             return task_result(run)
         return mutate(session, request, response, body.model_dump(mode="json"), action, 202)
@@ -883,13 +1114,20 @@ def create_app(start_dispatcher=True):
     @app.put("/api/reports/{id}/current-version", response_model=schemas.AdoptedVersionResponse, tags=["reports"])
     def adopt_version(id: UUID, body: schemas.CurrentVersionUpdate, request: Request, response: Response, session: DB):
         def action():
+            report = owned(session, Report, id)
+            owned(session, Project, report.project_id, lock=True)
             report = owned(session, Report, id, lock=True)
             if report.current_version_id != str(body.expected_current_version_id):
                 raise AppError(409, "REPORT_VERSION_CONFLICT", "当前采用版本已更新")
             version = owned(session, ReportVersion, body.version_id)
             if version.report_id != report.id:
                 raise AppError(404, "REPORT_VERSION_NOT_FOUND", "版本不属于此报告")
-            report.current_version_id = version.id
+            from app.research_service import ensure_for_report, adopt
+            ensure_for_report(session, report)
+            research = owned(session, ResearchVersion, version.research_id, lock=True)
+            if research.current_revision_id != version.id:
+                raise AppError(409, "RESTORE_REQUIRED", "请通过恢复历史内容操作采用此记录")
+            adopt(session, research, str(body.expected_current_version_id))
             return {"report_id": report.id, "current_version_id": version.id}
         return mutate(session, request, response, body.model_dump(mode="json"), action)
 

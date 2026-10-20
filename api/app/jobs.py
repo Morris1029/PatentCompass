@@ -40,13 +40,41 @@ def emit_event(session, run_id: str, event_type: str, payload: dict):
 
 
 def create_run(session, kind: str, project=None, payload=None, conversation_id=None, retry_of_id=None):
+    payload = dict(payload or {})
+    research = None
+    if project:
+        from app.models import Report, ReportVersion, ResearchVersion
+        from app.research_service import ensure_for_report, for_conversation
+        if payload.get("research_id"):
+            research = session.get(ResearchVersion, str(payload["research_id"]))
+            if not research or session.get(Report, research.report_id).project_id != project.id:
+                raise AppError(404, "RESEARCH_NOT_FOUND", "研究版本不属于此项目")
+        elif conversation_id:
+            research = for_conversation(session, conversation_id)
+        if not research and payload.get("base_version_id"):
+            base = session.get(ReportVersion, str(payload["base_version_id"]))
+            if base and session.get(Report, base.report_id).project_id == project.id:
+                report = session.get(Report, base.report_id)
+                ensure_for_report(session, report)
+                research = session.get(ResearchVersion, base.research_id)
+        if not research and not conversation_id and kind in {"chat", "auto", "analyze", "generate_report", "revise_report", "restore_report"}:
+            report = session.scalar(select(Report).where(Report.project_id == project.id))
+            if report:
+                research = ensure_for_report(session, report)
+    if research:
+        payload.update(research_id=research.id)
+        if research.analysis_id and not payload.get("analysis_id"):
+            payload["analysis_id"] = research.analysis_id
+        if research.current_revision_id:
+            payload.setdefault("reference_version_id", research.current_revision_id)
     row = ResearchRun(owner_id=get_settings().dev_owner_id, project_id=project.id if project else None,
-                      conversation_id=conversation_id, kind=kind, payload=payload or {},
-                      scope_version_id=project.scope_version_id if project else None,
-                      dataset_version_ids=[project.dataset_version_id] if project and project.dataset_version_id else [],
+                      conversation_id=conversation_id, kind=kind, payload=payload,
+                      scope_version_id=research.scope_version_id if research else project.scope_version_id if project else None,
+                      dataset_version_ids=list(research.dataset_version_ids) if research else [project.dataset_version_id] if project and project.dataset_version_id else [],
                       retry_of_id=retry_of_id, status="queued", dispatch_pending=True)
     session.add(row)
     session.flush()
+    row.payload = {**row.payload, "operation_id": row.payload.get("operation_id") or row.id}
     emit_event(session, row.id, "step.updated", {"status": "queued", "step": "dispatch"})
     return row
 
@@ -177,9 +205,11 @@ def _outcome_message(session, ctx, result):
             previous.run_id = ctx.run_id
             return
         run = session.get(ResearchRun, run.retry_of_id)
-    labels = {"analysis_id": "分析已完成", "report_version_id": "报告版本已保存并采用",
+    labels = {"analysis_id": "分析已完成", "report_version_id": "报告已更新",
               "chart_version_id": "图表新版本已保存并采用", "scope_version_id": "研究范围已确认"}
     message = next((label for key, label in labels.items() if result.get(key)), "研究任务已完成")
+    if result.get("report_version_id"):
+        message = "报告内容未变化" if result.get("unchanged") else "报告已恢复并采用" if result.get("change_kind") == "restore" else "报告已生成" if result.get("parent_id") is None else "报告已更新"
     session.add(Message(conversation_id=ctx.conversation_id, run_id=ctx.run_id, role="assistant", content=message,
                         cards=[{"type": "artifact", "run_id": ctx.run_id, **result}]))
 
@@ -204,12 +234,13 @@ def execute_run(run_id: str):
     heartbeat = threading.Thread(target=_heartbeat, args=(run_id, token, stopped), daemon=True)
     heartbeat.start()
     ctx = RunContext(run_id, token)
+    ctx.defer_report_publish = True
     try:
         _confirm_scope(ctx)
         from app import chart_service, data_service, materials_service, merge_service, orchestration, report_service, semantic_service
         handlers = {"import": data_service.import_dataset, "analyze": run_analysis,
                     "index": data_service.build_embeddings, "generate_report": report_service.generate_report,
-                    "revise_report": report_service.revise_report, "export": report_service.export_report,
+                    "revise_report": report_service.revise_report, "restore_report": report_service.restore_report, "export": report_service.export_report,
                     "chat": _chat, "auto": orchestration.execute, "parse_material": materials_service.parse_material,
                     "merge_import": merge_service.merge_dataset, "revise_analysis": semantic_service.revise_analysis,
                     "revise_chart": chart_service.revise_chart}
@@ -225,9 +256,15 @@ def execute_run(run_id: str):
         else:
             result = handlers[ctx.kind](ctx)
         with session_scope() as session:
+            result = report_service.publish_candidate(session, ctx, result)
+            if ctx.payload.get("forwarding"):
+                result = {**result, "forwarding": ctx.payload["forwarding"]}
             run = ctx.guard(session)
             run.status, run.result = "succeeded", result
             _outcome_message(session, ctx, result)
+            if result.get("report_version_id"):
+                emit_event(session, run.id, "activity.updated", {"id": "revise_report" if result.get("change_kind") in {"edit", "restore"} else "generate_report",
+                           "kind": "revise_report" if result.get("change_kind") in {"edit", "restore"} else "generate_report", "status": "succeeded", **result})
             run.lease_token, run.lease_expires_at = None, None
             emit_event(session, run.id, "artifact.ready", result)
             emit_event(session, run.id, "run.completed", {"status": "succeeded", "result": result})

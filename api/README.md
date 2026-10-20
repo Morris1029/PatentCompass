@@ -74,7 +74,7 @@ EMBEDDING_MODEL=...
 
 以下为设计中的 29 个业务操作；健康检查和文档路由另外提供。长任务返回 `202` 和 `run_id`，结果通过运行接口读取。
 
-这 29 项继续兼容；完整前端另有 7 项增量操作：项目资料上传/列表、资料详情、分析归属修订，以及图表版本列表/修订/采用。当前共 36 项业务操作，具体字段以 OpenAPI 为准。
+完整前端另有资料、图表修订和研究版本等增量操作。当前共 44 项业务操作，具体字段以 OpenAPI 为准。
 
 | 方法与路径 | 用途 |
 | --- | --- |
@@ -148,6 +148,18 @@ EMBEDDING_MODEL=...
 范围、数据绑定和报告当前版本更新分别携带 `expected_scope_version_id`、`expected_revision`、`expected_current_version_id`；过期更新返回 `409`。报告路径中的 `{version}` 使用版本 UUID，不是数字序号。结构化修改指定 `base_version_id`、`expected_current_version_id`、`block_id` 与 `replacement_text`；自然语言修改用 `instruction` 替换 `replacement_text`，两者只能提供一项。需要可靠重试写入时携带 `Idempotency-Key`，相同键与相同请求复用原结果，避免重复提交任务。分页使用接口返回的 `next_cursor`，不自行拼接游标。SSE 使用 `after` 查询参数或 `Last-Event-ID` 请求头续读。
 
 报告版本目录可使用 `GET /api/reports/{id}/versions?summary=true`，仅返回版本元数据并在数据库中分页。浏览和比较使用 `GET /api/reports/{id}/versions/{version}?view=display`，保留版本元数据，正文仅含 `title`、`layout`、`blocks`；不传这些参数时继续返回原有完整内容。历史快照仍完整保存，比较不会创建版本或生成 Word。
+
+报告的 V1、V2 表示研究轮次。日常正文、图表与排版修改在所属研究中追加不可变修改记录，不增加研究编号；无实际变化不保存新记录。旧报告快照统一归入 V1，原 UUID、父链、正文和采用位置保留。`versions` 目录可增加 `research_id` 筛选，同研究比较修改记录，跨研究比较整体报告。
+
+`GET /api/reports/{id}/research-versions` 分页返回已发布研究；`POST` 同路径携带 `base_revision_id`，只在同一项目创建新主对话及未编号草稿。草稿第一次成功生成报告时，才分配下一个研究编号并采用。普通聊天、分析完成、失败、取消均不占号。
+
+`GET /api/research-versions/{id}` 返回研究详情及独立上下文；`POST /api/research-versions/{id}/conversation` 确保并返回固定主对话。范围、数据、分析任务可传 `research_id`，分别维护各轮研究的工作上下文。报告追问默认使用报告冻结依据，明确询问工作分析时采用该研究的工作上下文。
+
+`PUT /api/research-versions/{id}/adopt` 携带 `expected_current_version_id` 采用该研究最新内容。`POST /api/research-versions/{id}/restore` 携带 `revision_id`、所属研究的 `expected_current_version_id` 和项目的 `expected_adopted_version_id`，异步追加恢复记录并采用所属研究；其它研究和修改历史保留。旧 `current-version` 接口只用于采用研究的最新记录，历史内容须通过恢复接口操作。
+
+从报告进入修改时复用所属主对话。普通对话内确认修改后，同一任务转交主对话，原消息保留关联入口；来源通过 `source_message_id` 保留。`GET /api/conversations/{id}/messages/{message}/context` 支持读取目标消息上下文，前端 `message=<id>` 可定位高亮。页面直接保存没有对话来源时显示“报告页面保存”。
+
+报告先计算候选内容，最终快照、研究编号、采用位置、任务成功、成果消息和事件在同一事务发布。稳定操作标识跨重试复用；发布时校验当前记录，生成与恢复还校验研究上下文，避免并发静默覆盖。修改非当前研究只更新该研究；显式恢复才切换采用状态。
 
 ## 模型与结果边界
 

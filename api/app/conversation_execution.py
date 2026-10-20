@@ -6,40 +6,129 @@ import re
 from sqlalchemy import select
 
 from app.db import session_scope
-from app.models import Dataset, DatasetVersion, Project, ReportVersion, ResearchRun, RunEvent, RunStep, ScopeVersion, new_id
+from app.errors import AppError
+from app.models import (Dataset, DatasetVersion, Project, Report, ReportVersion, ResearchRun,
+                        ResearchVersion, RunEvent, RunStep, ScopeVersion, new_id)
 
 
-CONTROL_FIELDS = {"execution_authorization"}
+CONTROL_FIELDS = {"execution_authorization", "operation_id"}
 SEARCH_ACTIONS = {"search_patents", "search_materials"}
+REPORT_ACTIONS = {"generate_report", "revise_report"}
 LABELS = {"search_patents": "检索专利", "search_materials": "检索项目资料", "analyze": "分析专利样本",
           "generate_report": "生成导航报告", "revise_report": "修改导航报告", "revise_chart": "修改图表",
           "scope": "更新研究范围"}
 RESULT_FIELDS = {"matched_count", "report_version_id", "report_id", "analysis_id", "chart_version_id", "chart_id",
                  "file_id", "number", "parent_id", "download_url", "application_count", "query_counts",
-                 "scope_application_count"}
+                 "scope_application_count", "research_id", "research_number", "main_conversation_id", "source_message_id",
+                 "source_conversation_id", "change_count", "change_summary", "change_kind", "unchanged"}
+
+
+def prepare_assignment(session, run, plan=None, *, refresh=False):
+    """Freeze one candidate without assigning a conversation or changing research context."""
+    plan = plan or run.payload.get("plan", {})
+    if plan.get("action", run.kind) not in REPORT_ACTIONS:
+        return None
+    proposal = run.payload.get("research_proposal")
+    if run.payload.get("research_decision") or (proposal and not refresh):
+        return proposal
+    report = session.scalar(select(Report).where(Report.project_id == run.project_id))
+    if proposal:
+        existing_id = proposal.get("existing_research_id")
+        research = session.get(ResearchVersion, existing_id) if existing_id else None
+    else:
+        from app.research_service import for_conversation
+        research = session.get(ResearchVersion, run.payload["research_id"]) if run.payload.get("research_id") else None
+        research = research or for_conversation(session, run.conversation_id)
+        reference_id = run.payload.get("reference_version_id")
+        reference = session.get(ReportVersion, reference_id) if reference_id else None
+        if not research and reference and reference.research_id:
+            research = session.get(ResearchVersion, reference.research_id)
+        bound = research is not None
+        target_id = plan.get("target_research_id")
+        if not research and target_id:
+            research = session.get(ResearchVersion, str(target_id))
+            if not research or not report or research.report_id != report.id:
+                raise AppError(422, "RESEARCH_TARGET_INVALID", "计划中的研究目标不属于此项目，请重新核对")
+        if not research and report and report.current_research_id:
+            research = session.get(ResearchVersion, report.current_research_id)
+        intent = plan.get("research_intent") or ("continue" if bound else "choose")
+        if bound and intent == "choose" and not plan.get("research_reason"):
+            intent = "continue"
+        if not research:
+            intent = "new"
+        proposal = {"intent": intent, "reason": plan.get("research_reason", ""),
+                    "topic": plan.get("research_topic", ""),
+                    "existing_research_id": research.id if research else None,
+                    "expected_adopted_version_id": report.current_version_id if report else None}
+    if research and (not report or research.report_id != report.id):
+        raise AppError(422, "RESEARCH_TARGET_INVALID", "计划中的研究目标不属于此项目，请重新核对")
+    proposal = {**proposal,
+        "base_revision_id": (research.current_revision_id or research.base_revision_id) if research else None,
+        "existing_current_revision_id": research.current_revision_id if research else None,
+        "existing_revision": research.revision if research else None,
+        "existing_scope_version_id": research.scope_version_id if research else None,
+        "existing_dataset_version_ids": list(research.dataset_version_ids) if research else []}
+    run.payload = {**run.payload, "research_proposal": proposal}
+    return proposal
+
+
+def _assignment_request(session, run, proposal):
+    if not proposal:
+        return None
+    existing_id = proposal.get("existing_research_id")
+    research = session.get(ResearchVersion, existing_id) if existing_id else None
+    title = session.scalar(select(ReportVersion.content["title"].astext).where(
+        ReportVersion.id == research.current_revision_id)) if research and research.current_revision_id else None
+    decision = run.payload.get("research_decision")
+    recommended = (decision["choice"] if decision else "new" if not research or proposal["intent"] == "new"
+                   else "existing" if proposal["intent"] in {"continue", "target"} else None)
+    from app.research_service import for_conversation
+    bound = for_conversation(session, run.conversation_id)
+    return {"intent": proposal["intent"], "reason": proposal.get("reason", ""),
+            "topic": proposal.get("topic", ""), "recommended": recommended,
+            "existing_research_id": research.id if research else None,
+            "existing_number": research.number if research else None,
+            "existing_title": title or ("尚未生成报告的研究" if research else None),
+            "existing_conversation_id": research.main_conversation_id if research else None,
+            "new_uses_current_conversation": bound is None,
+            "allow_new": not decision or decision["choice"] == "new",
+            "allow_existing": bool(research) and (not decision or decision["choice"] == "existing"),
+            "fixed": bool(decision)}
 
 
 def execution_context(session, run):
     project = session.get(Project, run.project_id) if run.project_id else None
     payload = run.payload
+    research = session.get(ResearchVersion, payload.get("research_id")) if payload.get("research_id") else None
+    proposal = payload.get("research_proposal")
+    candidate = session.get(ResearchVersion, proposal["existing_research_id"]) if proposal and proposal.get("existing_research_id") else None
+    basis = research or candidate
     frozen = {"scope_version_id": run.scope_version_id, "dataset_version_ids": run.dataset_version_ids,
               "plan": payload.get("plan"), "kind": run.kind, "message_id": payload.get("message_id"),
               "attachments": payload.get("attachments", []),
               "targets": {key: payload.get(key) for key in (
                   "reference_version_id", "plan_report_version_id", "plan_report_current_id", "target_version_id",
                   "target_current_id", "target_block_ids", "chart_plan_version_id", "chart_data_confirmed")},
-              "project_scope": project.scope_version_id if project else None,
-              "project_data": project.dataset_version_id if project else None}
+              "research_id": research.id if research else None,
+              "research_proposal": proposal, "research_decision": payload.get("research_decision"),
+              "proposal_context": {"head": candidate.current_revision_id, "revision": candidate.revision}
+                                  if candidate and not payload.get("research_decision") else None,
+              "project_scope": basis.scope_version_id if basis else project.scope_version_id if project else None,
+              "project_data": basis.dataset_version_ids if basis else project.dataset_version_id if project else None}
     return hashlib.sha256(json.dumps(frozen, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
 
 
 def execution_request(session, run, actions, *, changed=False):
+    report_action = bool({action["kind"] for action in actions} & REPORT_ACTIONS)
+    proposal = prepare_assignment(session, run, refresh=changed) if report_action else None
+    assignment = _assignment_request(session, run, proposal)
     scope = session.get(ScopeVersion, run.scope_version_id) if run.scope_version_id else None
+    proposed_scope = {**(scope.content if scope else {}), **run.payload.get("plan", {}).get("scope_changes", {})}
     names = {"industry": "研究领域", "goal": "研究目标", "need": "研究需求", "focus": "关注重点", "q": "关键词",
              "applicant": "申请人", "ipc": "技术分类", "start": "开始年份", "end": "结束年份",
              "application_start": "申请开始日期", "application_end": "申请结束日期", "source_region": "来源地区",
              "coverage": "覆盖范围"}
-    details = {names[key]: value for key, value in (scope.content if scope else {}).items()
+    details = {names[key]: value for key, value in proposed_scope.items()
                if key in names and value not in (None, "")}
     sources = []
     for version_id in run.dataset_version_ids:
@@ -52,7 +141,9 @@ def execution_request(session, run, actions, *, changed=False):
     version_id = run.payload.get("target_version_id") or run.payload.get("reference_version_id") or run.payload.get("plan_report_version_id")
     version = session.get(ReportVersion, version_id) if version_id else None
     if version:
-        details["报告目标"] = f"{version.content['title']}（第 {version.number} 版）"
+        from app.models import ResearchVersion
+        research = session.get(ResearchVersion, version.research_id) if version.research_id else None
+        details["报告目标"] = f"{version.content['title']}（V{research.number}）" if research and research.number else version.content['title']
         targets = run.payload.get("target_block_ids") or run.payload.get("plan", {}).get("block_ids", [])
         if targets:
             details["修改段落"] = [block.get("text", block["type"])[:160]
@@ -60,6 +151,8 @@ def execution_request(session, run, actions, *, changed=False):
     readable = [f"{label}：{'、'.join(str(item) for item in value) if isinstance(value, list) else value}"
                 for label, value in details.items()]
     allowed_actions = {action["kind"] for action in actions} | SEARCH_ACTIONS
+    if assignment and assignment["allow_new"]:
+        allowed_actions |= {"analyze", "generate_report"}
     if "generate_report" in allowed_actions:
         allowed_actions.add("analyze")
         if scope_editable_for_run(run):
@@ -67,15 +160,22 @@ def execution_request(session, run, actions, *, changed=False):
     if changed:
         readable.append("执行说明：本轮继续采用以上已选范围、数据和目标")
     actions = [{**action, "details": readable} for action in actions]
-    return {"id": new_id(), "kind": "execution_confirmation", "context": execution_context(session, run),
+    target = {}
+    if run.payload.get("research_id") and report_action:
+        research = session.get(ResearchVersion, run.payload["research_id"])
+        target = {"target_research_id": research.id, "target_conversation_id": research.main_conversation_id,
+                  "research_number": research.number}
+    return {"id": new_id(), "kind": "execution_confirmation", "context": execution_context(session, run), **target,
             "prompt": "本轮研究范围、数据或目标已变化，请核对后确认" if changed else "请确认本轮拟执行的操作",
             "actions": actions, "allowed_actions": sorted(allowed_actions),
-            "scope": dict(scope.content) if scope else {}, "scope_editable": scope_editable_for_run(run)}
+            "scope": proposed_scope, "expected_scope_version_id": run.scope_version_id,
+            "scope_editable": scope_editable_for_run(run),
+            **({"research_assignment": assignment} if assignment else {})}
 
 
 def scope_editable_for_run(run):
     action = run.payload.get("plan", {}).get("action", run.kind)
-    return action in {"chat", "analyze", "generate_report"} and not run.payload.get("reference_version_id")
+    return action in {"chat", "analyze", "generate_report"} and (not run.payload.get("reference_version_id") or bool(run.payload.get("research_id")) or bool(run.payload.get("research_proposal")))
 
 
 def require_execution(ctx, kinds):
@@ -83,9 +183,16 @@ def require_execution(ctx, kinds):
         return
     from app.jobs import WaitingForInput, emit_event
     with session_scope() as session:
+        from app.models import ResearchVersion
+        session.scalar(select(Project).where(Project.id == ctx.project_id).with_for_update())
+        if ctx.payload.get("research_id"):
+            session.scalar(select(ResearchVersion).where(ResearchVersion.id == ctx.payload["research_id"]).with_for_update())
         run = ctx.guard(session)
+        if set(kinds) & REPORT_ACTIONS:
+            prepare_assignment(session, run)
         authorization = run.payload.get("execution_authorization", {})
-        if (authorization.get("context") == execution_context(session, run)
+        assignment_pending = bool(run.payload.get("research_proposal")) and not run.payload.get("research_decision")
+        if (not assignment_pending and authorization.get("context") == execution_context(session, run)
                 and set(kinds) <= set(authorization.get("allowed_actions", []))):
             return
         actions = [{"kind": kind, "label": LABELS[kind]} for kind in dict.fromkeys(kinds)]
@@ -118,6 +225,8 @@ def run_activity(ctx, activity_id, kind, callback, *, details=None):
     except Exception:
         ctx.emit("activity.updated", {**activity, "status": "failed"})
         raise
+    if result.get("_report_candidate"):
+        return result
     ctx.emit("activity.updated", {**activity, "status": "succeeded",
                                   **{key: value for key, value in result.items() if key in RESULT_FIELDS}})
     return result
@@ -138,11 +247,13 @@ def _artifact_details(session, activity):
     if activity.get("report_version_id"):
         version = session.get(ReportVersion, activity["report_version_id"])
         if version:
-            activity.update(report_id=version.report_id, number=version.number, parent_id=version.parent_id,
-                            analysis_id=version.analysis_id)
+            from app.models import Report
+            from app.research_service import version_result
+            unchanged = activity.get("unchanged")
+            activity.update(version_result(session, session.get(Report, version.report_id), version))
             parent = session.get(ReportVersion, version.parent_id) if version.parent_id else None
             summary = report_change_summary(version.content, parent.content) if parent else {}
-            activity.update(change_summary=summary, change_count=sum(summary.values()), is_initial=parent is None)
+            activity.update(change_summary={} if unchanged else summary, change_count=0 if unchanged else sum(summary.values()), is_initial=parent is None)
     return activity
 
 

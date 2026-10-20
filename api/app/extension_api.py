@@ -14,7 +14,7 @@ from app.models import (AnalysisResult, Chart, ChartVersion, Material, MaterialB
 
 
 def register(app):
-    from app.main import DB, mutate, owned, paginate, record, task_result
+    from app.main import DB, mutate, owned, paginate, record, task_result, research_for
 
     def material_record(session, row):
         file = session.get(StoredFile, row.file_id)
@@ -75,7 +75,9 @@ def register(app):
             base = owned(session, AnalysisResult, body.base_analysis_id)
             if base.project_id != project.id:
                 raise AppError(404, "ANALYSIS_NOT_FOUND", "分析不属于当前项目")
-            if project.current_analysis_id != str(body.expected_current_analysis_id) or project.current_analysis_id != base.id:
+            research = research_for(session, project, body.research_id)
+            current_analysis = research.analysis_id if research else project.current_analysis_id
+            if current_analysis != str(body.expected_current_analysis_id) or current_analysis != base.id:
                 raise AppError(409, "ANALYSIS_VERSION_CONFLICT", "采用分析已变化，请保留修改并刷新")
             run = create_run(session, "revise_analysis", project, body.model_dump(mode="json"))
             run.scope_version_id, run.dataset_version_ids = base.scope_version_id, list(base.dataset_version_ids)
@@ -103,6 +105,9 @@ def register(app):
                 raise AppError(409, "CHART_VERSION_CONFLICT", "图表采用版本已变化")
             project = owned(session, Project, chart.project_id)
             analysis = session.get(AnalysisResult, chart.analysis_id)
+            research = research_for(session, project, body.research_id)
+            if research and research.analysis_id != analysis.id:
+                raise AppError(409, "CHART_RESEARCH_MISMATCH", "图表不属于本轮采用的分析")
             run = create_run(session, "revise_chart", project, {**body.model_dump(mode="json"), "chart_id": chart.id})
             run.scope_version_id, run.dataset_version_ids = analysis.scope_version_id, list(analysis.dataset_version_ids)
             return task_result(run)

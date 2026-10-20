@@ -1,6 +1,8 @@
 "use client";
 import { Fragment, useEffect, useRef, useState } from "react";
+import { useSearchParams } from "next/navigation";
 import { api, Json, Page, post, refresh, statusLabel, useApi } from "@/lib/api";
+import { researchLabel } from "@/lib/research";
 import { DraftAttachment, useStore } from "@/lib/store";
 import { AssistantMark, ErrorNotice, Modal, TaskCard } from "./shared";
 import MessageMarkdown from "./message-markdown";
@@ -8,7 +10,8 @@ import type { Navigate } from "./workspace";
 
 type Attachment = DraftAttachment;
 const EMPTY_ATTACHMENTS: Attachment[] = [];
-export default function Chat({ project, conversationId, navigate, createProject }: { project?: Json; conversationId: string | null; navigate: Navigate; createProject: () => void }) {
+export default function Chat({ project, conversationId, conversation, navigate, createProject }: { project?: Json; conversationId: string | null; conversation?: Json; navigate: Navigate; createProject: () => void }) {
+  const params = useSearchParams(); const targetMessage = params.get("message"); const located = useRef<string | undefined>(undefined);
   const key = `${project?.id || "welcome"}:${conversationId || "draft"}`;
   const draft = useStore(s => s.drafts[key]); const setDraft = useStore(s => s.draft); const track = useStore(s => s.track);
   const attachments = draft?.attachments || EMPTY_ATTACHMENTS;
@@ -18,6 +21,7 @@ export default function Chat({ project, conversationId, navigate, createProject 
   const [material, setMaterial] = useState<Json>(); const [older, setOlder] = useState<Json[]>([]);
   const fileInput = useRef<HTMLInputElement>(null);
   const { data: messages, error: messagesError } = useApi<Page>(conversationId ? `/api/conversations/${conversationId}/messages?limit=200` : null, 3000);
+  const { data: messageContext, error: contextError } = useApi<Page>(conversationId && targetMessage ? `/api/conversations/${conversationId}/messages/${targetMessage}/context` : null);
   const { data: materials } = useApi<Page>(project ? `/api/projects/${project.id}/materials?limit=200` : null, attachments.length ? 2000 : 0);
   useEffect(() => { setOlder([]); setError(undefined); fileCache.current.clear(); }, [key]);
   useEffect(() => {
@@ -65,22 +69,29 @@ export default function Chat({ project, conversationId, navigate, createProject 
       const body = { content: draft?.content?.trim() || "", action: "auto", attachments: attachments.map(item => item.materialId), ...(draft?.reference ? { reference: draft.reference } : {}), report_mode: "ai", semantic_mode: "full" };
       const result = conversationId ? await post(`/api/conversations/${conversationId}/messages`, body, submissionKey) : await post(`/api/projects/${project.id}/conversations`, { initial_message: body }, submissionKey);
       track(project.id, result.run_id); setDraft(key, { content: "", reference: undefined, attachments: [], submissionKey: undefined }); await refresh();
-      if (!conversationId) navigate({ conversation: result.conversation_id, view: "chat" });
+      if (!conversationId) navigate({ conversation: result.conversation_id, research: result.research_id || null, message: null, view: "chat" });
     } catch (e) { setError(e); } finally { setBusy(false); }
   };
-  const allMessages = [...older, ...(messages?.items || [])].sort((a, b) => a.created_at.localeCompare(b.created_at) || a.id.localeCompare(b.id)).filter((message, index, list) => list.findIndex(item => item.id === message.id) === index);
+  const allMessages = [...older, ...(messageContext?.items || []), ...(messages?.items || [])].sort((a, b) => a.created_at.localeCompare(b.created_at) || a.id.localeCompare(b.id)).filter((message, index, list) => list.findIndex(item => item.id === message.id) === index);
+  useEffect(() => {
+    const location = `${conversationId}:${targetMessage}`;
+    if (!targetMessage || located.current === location || !allMessages.some(message => message.id === targetMessage)) return;
+    const timer = setTimeout(() => { const element = document.getElementById(`message-${targetMessage}`); if (element) { element.scrollIntoView({ behavior: "smooth", block: "center" }); element.focus({ preventScroll: true }); located.current = location; } }, 100);
+    return () => clearTimeout(timer);
+  }, [conversationId, targetMessage, messages, messageContext]);
   const taskOwners = new Map<string, string>();
   allMessages.forEach(message => { if (message.run_id && (message.role === "assistant" || !taskOwners.has(message.run_id))) taskOwners.set(message.run_id, message.id); });
   return <section className={`home-workbench ${allMessages.length ? "has-conversation" : ""}`} aria-label="研究对话">
+    {conversation?.research && <div className="research-conversation-banner"><div><strong>{conversation.research.number ? `V${conversation.research.number} · ${conversation.research.main_conversation_id === conversationId ? "研究主对话" : "关联研究"}` : "新研究 · 准备中"}</strong><p>{conversation.research.status === "draft" ? "完善研究目标后，再确认生成报告。成功保存后才分配新的研究版本编号。" : "日常报告修改保存在本研究的修改记录中。"}</p></div>{(conversation.research.current_revision_id || conversation.research.current_version_id) && <button className="text-button" onClick={() => navigate({ view: "report", research: conversation.research_id, version: null, diff: null, anchor: null, message: null })}>查看报告 →</button>}</div>}
     {!allMessages.length && <section className="agent-welcome"><span className="welcome-mark" aria-hidden="true">✦</span><h1>从一个产业问题开始</h1><p>描述研究目标，逐步完善项目底稿与导航报告。</p>{!project && <button className="btn secondary welcome-create" onClick={createProject}>创建研究项目</button>}</section>}
-    <ErrorNotice error={messagesError || error} />
+    <ErrorNotice error={messagesError || contextError || error} />
     {allMessages.length > 0 && <div className="conversation-thread" aria-live="polite">{messages?.next_cursor && <button className="text-button" onClick={async () => { const result = await api<Page>(`/api/conversations/${conversationId}/messages?limit=200&cursor=${messages.next_cursor}`); setOlder(current => [...current, ...result.items]); }}>加载更多消息</button>}
-      {allMessages.map(message => <Fragment key={message.id}><article className={`conversation-message ${message.role}`} data-message-id={message.id}>{message.role !== "user" && <AssistantMark />}<div className={message.role === "user" ? "message-content" : "assistant-content"}>
+      {allMessages.map(message => <Fragment key={message.id}><article id={`message-${message.id}`} tabIndex={targetMessage === message.id ? -1 : undefined} className={`conversation-message ${message.role}${targetMessage === message.id ? " is-targeted" : ""}`} data-message-id={message.id}>{message.role !== "user" && <AssistantMark />}<div className={message.role === "user" ? "message-content" : "assistant-content"}>
         {message.reference?.text && <blockquote className="message-reference"><span className="label">引用报告历史版本</span><p>{message.reference.text}</p></blockquote>}
         {message.role === "user" ? <p className="message-text">{message.content || (message.attachments?.length ? "已提交项目资料" : "")}</p> : <MessageMarkdown content={message.content || ""} />}
         {message.attachments?.length > 0 && <div className="message-attachments">{message.attachments.map((id: string) => { const item = materials?.items.find(entry => entry.id === id); return <button key={id} className="attachment-chip" onClick={async () => setMaterial(await api(`/api/materials/${id}`))}>▤ {item?.file_name || item?.original_name || item?.name || "Word 资料"}</button>; })}</div>}
         {message.reference?.citations?.map((citation: Json, i: number) => <details key={citation.id || i} className="compact-details"><summary>原文依据 {i + 1} · {citation.application_number || citation.title || "资料"}</summary><p className="small whitespace">{citation.text || citation.abstract || citation.quote}</p><button className="text-button" onClick={async () => { if (citation.material_id) setMaterial(await api(`/api/materials/${citation.material_id}`)); else navigate({ view: "workbench", tab: "data", patent: citation.application_id || citation.patent_id || citation.id, analysis_id: message.reference?.analysis_id || null }); }}>定位记录</button></details>)}
-        {!message.run_id && (message.cards || []).filter((card: Json) => card.type !== "task").map((card: Json, i: number) => <div className="artifact-card" key={card.id || i}><strong>{card.title || card.summary || (card.report_version_id ? `导航报告 V${card.number || ""}` : card.analysis_id ? "研究分析已完成" : card.chart_version_id ? "图表新版本" : "研究成果")}</strong><p className="small muted">{card.description}</p><div className="actions">{(card.report_version_id || card.version_id) && <button className="text-button" onClick={() => navigate({ view: "report", version: card.report_version_id || card.version_id, diff: card.parent_id || "parent", anchor: card.block_id || null })}>查看改动 →</button>}{card.analysis_id && <button className="text-button" onClick={() => navigate({ view: "workbench", tab: "overview", analysis_id: card.analysis_id })}>打开分析 →</button>}</div></div>)}
+        {!message.run_id && (message.cards || []).filter((card: Json) => card.type !== "task").map((card: Json, i: number) => <div className="artifact-card" key={card.id || i}><strong>{card.report_version_id ? `导航报告${card.research_number ? ` · ${researchLabel(card)}` : ""}` : card.title || card.summary || (card.analysis_id ? "研究分析已完成" : card.chart_version_id ? "图表新版本" : "研究成果")}</strong><p className="small muted">{card.description}</p><div className="actions">{card.type === "forward" && card.conversation_id && <button className="text-button" onClick={() => navigate({ view: "chat", conversation: card.conversation_id, research: card.research_id || null, message: card.message_id || null, version: null, diff: null, anchor: null })}>前往报告主对话 →</button>}{(card.report_version_id || card.version_id) && <button className="text-button" onClick={() => navigate({ view: "report", research: card.research_id || null, version: card.report_version_id || card.version_id, diff: card.parent_id || "parent", anchor: card.block_id || null, message: null })}>查看改动 →</button>}{card.analysis_id && <button className="text-button" onClick={() => navigate({ view: "workbench", tab: "overview", analysis_id: card.analysis_id })}>打开分析 →</button>}</div></div>)}
         {message.role !== "user" && taskOwners.get(message.run_id) === message.id && <TaskCard id={message.run_id} project={project} presentation="chat" hasReply navigate={navigate} artifacts={message.cards || []} />}
       </div></article>{message.role === "user" && taskOwners.get(message.run_id) === message.id && <TaskCard id={message.run_id} project={project} presentation="chat" navigate={navigate} />}</Fragment>)}
     </div>}

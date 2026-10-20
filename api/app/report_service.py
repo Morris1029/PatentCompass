@@ -24,6 +24,9 @@ from app.models import (
     AnalysisResult, Chart, Conversation, DatasetVersion, Evidence, PatentApplication,
     PatentPublication, Project, Report, ReportVersion, ResearchRun, ScopeVersion, StoredFile,
 )
+from app.research_service import (
+    context_for, ensure_for_report, publish_candidate, research_for_context, version_result,
+)
 
 
 DEFAULT_REPORT_LAYOUT = {
@@ -34,10 +37,8 @@ DEFAULT_REPORT_LAYOUT = {
 }
 
 
-def _version_result(report, version):
-    return {"report_id": report.id, "report_version_id": version.id,
-            "number": version.number, "current_version_id": report.current_version_id,
-            "parent_id": version.parent_id}
+def _version_result(session, report, version):
+    return version_result(session, report, version)
 
 
 def _run_lineage(session, run_id):
@@ -60,7 +61,7 @@ def _saved_version(ctx):
             report = session.get(Report, previous.report_id)
             if report.project_id != ctx.project_id:
                 raise AppError(404, "REPORT_VERSION_NOT_FOUND", "报告版本不存在")
-            return _version_result(report, previous)
+            return _version_result(session, report, previous)
     return None
 
 
@@ -76,7 +77,10 @@ def _load_snapshot(ctx):
         project = session.get(Project, ctx.project_id)
         if not project:
             raise AppError(404, "PROJECT_NOT_FOUND", "项目不存在")
-        analysis_id = ctx.payload.get("analysis_id") or project.current_analysis_id
+        report = session.scalar(select(Report).where(Report.project_id == project.id))
+        research = research_for_context(session, ctx, report) if report else None
+        analysis_id = ctx.payload.get("analysis_id") or (
+            context_for(session, research)["analysis_id"] if research else project.current_analysis_id)
         analysis = session.get(AnalysisResult, analysis_id) if analysis_id else None
         if not analysis or analysis.project_id != ctx.project_id:
             raise AppError(409, "ANALYSIS_REQUIRED", "请先完成本项目的数据分析")
@@ -270,10 +274,37 @@ def build_report_content(snapshot):
             "representative_snapshot": deepcopy(snapshot["representatives"])}
 
 
+def _report_target(ctx):
+    with session_scope() as session:
+        _project(session, ctx.project_id)
+        report = session.scalar(select(Report).where(Report.project_id == ctx.project_id).with_for_update())
+        if not report:
+            report = Report(project_id=ctx.project_id)
+            session.add(report)
+            session.flush()
+        research = research_for_context(session, ctx, report)
+        ctx.guard(session)
+        return {"report_id": report.id, "research_id": research.id,
+                "expected_current_version_id": research.current_revision_id,
+                "expected_research_revision": research.revision,
+                "expected_adopted_version_id": report.current_version_id,
+                "conversation_id": getattr(ctx, "conversation_id", None) or ctx.payload.get("conversation_id"),
+                "source_message_id": ctx.payload.get("source_message_id") or ctx.payload.get("message_id")}
+
+
+def _complete_candidate(ctx, key, candidate):
+    result = {"_report_candidate": ctx.step(key, lambda: deepcopy(candidate))}
+    if getattr(ctx, "defer_report_publish", False):
+        return result
+    with session_scope() as session:
+        return publish_candidate(session, ctx, result)
+
+
 def generate_report(ctx):
     previous = _saved_version(ctx)
     if previous:
         return previous
+    target = ctx.step("report_target_snapshot", lambda: _report_target(ctx))
     snapshot = ctx.step("report_snapshot", lambda: _load_snapshot(ctx))
     content = build_report_content(snapshot)
     if ctx.payload.get("report_mode") == "ai":
@@ -291,29 +322,10 @@ def generate_report(ctx):
         content["blocks"].insert(1, {"id": str(uuid5(NAMESPACE_URL, f"{snapshot['analysis_id']}:ai-summary")),
                                     "type": "paragraph", "text": synthesis["text"], "origin": "model"})
     ctx.check_cancelled()
-    with session_scope() as session:
-        ctx.guard(session)
-        _project(session, ctx.project_id)
-        previous = session.scalar(select(ReportVersion).where(ReportVersion.run_id == ctx.run_id))
-        if previous:
-            return _version_result(session.get(Report, previous.report_id), previous)
-        report = session.scalar(select(Report).where(Report.project_id == ctx.project_id).with_for_update())
-        if not report:
-            report = Report(project_id=ctx.project_id)
-            session.add(report)
-            session.flush()
-        report.version_counter += 1
-        version = ReportVersion(report_id=report.id, number=report.version_counter,
-            parent_id=report.current_version_id, run_id=ctx.run_id, analysis_id=snapshot["analysis_id"],
-            scope_version_id=snapshot["scope_version_id"], dataset_version_ids=snapshot["dataset_version_ids"],
-            content=content, chart_ids=list(dict.fromkeys(block["chart_id"] for block in content["blocks"] if block["type"] == "chart")),
-            summary="根据固定数据与范围生成统计简报", instruction="生成统计简报",
-            conversation_id=getattr(ctx, "conversation_id", None))
-        session.add(version)
-        session.flush()
-        report.current_version_id = version.id
-        ctx.guard(session)
-        return _version_result(report, version)
+    candidate = {**target, "content": content, "analysis_id": snapshot["analysis_id"],
+        "scope_version_id": snapshot["scope_version_id"], "dataset_version_ids": snapshot["dataset_version_ids"],
+        "instruction": "生成统计简报", "summary": "根据固定数据与范围生成统计简报", "change_kind": "generate"}
+    return _complete_candidate(ctx, "report_candidate", candidate)
 
 
 def _response_text(response):
@@ -527,8 +539,16 @@ def revise_report(ctx):
             base = session.get(ReportVersion, payload["base_version_id"])
             if not report or report.project_id != ctx.project_id or not base or base.report_id != report.id:
                 raise AppError(404, "REPORT_VERSION_NOT_FOUND", "报告版本不存在")
-            if report.current_version_id != payload["expected_current_version_id"]:
-                raise AppError(409, "REPORT_VERSION_CONFLICT", "当前采用的版本已变化，请重新提交修改")
+            research = research_for_context(session, ctx, report)
+            legacy = not getattr(ctx, "defer_report_publish", False) and not payload.get("research_id")
+            if legacy and report.current_research_id == research.id:
+                # Direct service callers historically adopt by changing this pointer.
+                research.current_revision_id = report.current_version_id
+            if not research.current_revision_id:
+                raise AppError(409, "RESEARCH_REPORT_REQUIRED", "本轮研究请先生成首份报告")
+            if (base.research_id != research.id or base.id != research.current_revision_id
+                    or research.current_revision_id != payload["expected_current_version_id"]):
+                raise AppError(409, "REPORT_VERSION_CONFLICT", "本研究的最新报告已变化，请重新核对修改目标")
             conversation_id = getattr(ctx, "conversation_id", None) or payload.get("conversation_id")
             if conversation_id:
                 conversation = session.get(Conversation, conversation_id)
@@ -546,7 +566,12 @@ def revise_report(ctx):
                     raise AppError(422, "BLOCK_TYPE_UNSUPPORTED", "文字修改仅支持段落或标题")
             return {"content": content, "analysis_id": base.analysis_id,
                     "scope_version_id": base.scope_version_id, "dataset_version_ids": base.dataset_version_ids,
-                    "chart_ids": base.chart_ids, "block": deepcopy(block), "conversation_id": conversation_id}
+                    "chart_ids": base.chart_ids, "block": deepcopy(block), "conversation_id": conversation_id,
+                    "report_id": report.id, "research_id": research.id,
+                    "expected_current_version_id": research.current_revision_id,
+                    "expected_adopted_version_id": report.current_version_id,
+                    "legacy_adopted_check": legacy,
+                    "source_message_id": payload.get("source_message_id") or payload.get("message_id")}
 
     base = ctx.step("revision_snapshot", prepare)
     if payload.get("operations"):
@@ -568,28 +593,45 @@ def revise_report(ctx):
     if not payload.get("operations"):
         content = replace_block(base["content"], payload["block_id"], replacement)
     ctx.check_cancelled()
-    with session_scope() as session:
-        ctx.guard(session)
-        _project(session, ctx.project_id)
-        report = session.scalar(select(Report).where(Report.id == payload["report_id"]).with_for_update())
-        previous = session.scalar(select(ReportVersion).where(ReportVersion.run_id == ctx.run_id))
-        if previous:
-            return _version_result(report, previous)
-        if report.current_version_id != payload["expected_current_version_id"]:
-            raise AppError(409, "REPORT_VERSION_CONFLICT", "修改期间当前版本发生变化，本次未覆盖其他修改")
-        report.version_counter += 1
-        version = ReportVersion(report_id=report.id, number=report.version_counter,
-            parent_id=payload["base_version_id"], run_id=ctx.run_id, analysis_id=base["analysis_id"],
-            scope_version_id=base["scope_version_id"], dataset_version_ids=base["dataset_version_ids"],
-            content=content, chart_ids=list(dict.fromkeys(block["chart_id"] for block in content["blocks"] if block["type"] == "chart")),
-            instruction=payload.get("instruction") or ("按结构化操作修改报告" if payload.get("operations") else "替换指定文字块"),
-            summary=f"完成 {len(payload['operations'])} 项报告修改" if payload.get("operations") else "修改所选报告文字",
-            conversation_id=base["conversation_id"])
-        session.add(version)
-        session.flush()
-        report.current_version_id = version.id
-        ctx.guard(session)
-        return _version_result(report, version)
+    candidate = {key: value for key, value in base.items() if key not in {"block", "content", "chart_ids"}}
+    candidate.update({"content": content, "change_kind": "edit",
+        "instruction": payload.get("instruction") or ("按结构化操作修改报告" if payload.get("operations") else "替换指定文字块"),
+        "summary": f"完成 {len(payload['operations'])} 项报告修改" if payload.get("operations") else "修改所选报告文字"})
+    return _complete_candidate(ctx, "revision_candidate", candidate)
+
+
+def restore_report(ctx):
+    previous = _saved_version(ctx)
+    if previous:
+        return previous
+
+    def prepare():
+        with session_scope() as session:
+            from app.models import ResearchVersion
+            research = session.get(ResearchVersion, ctx.payload["research_id"])
+            report = session.get(Report, research.report_id) if research else None
+            source = session.get(ReportVersion, ctx.payload["restore_revision_id"])
+            if (not report or report.project_id != ctx.project_id or not source
+                    or source.research_id != research.id):
+                raise AppError(404, "REPORT_VERSION_NOT_FOUND", "恢复记录不存在")
+            if research.current_revision_id != ctx.payload["expected_current_version_id"]:
+                raise AppError(409, "REPORT_VERSION_CONFLICT", "本研究的报告已变化，请重新核对")
+            if report.current_version_id != ctx.payload["expected_adopted_version_id"]:
+                raise AppError(409, "REPORT_VERSION_CONFLICT", "当前采用的报告已变化，请重新核对")
+            return {"report_id": report.id, "research_id": research.id,
+                "expected_current_version_id": research.current_revision_id,
+                "expected_research_revision": research.revision,
+                "expected_adopted_version_id": report.current_version_id,
+                "content": deepcopy(source.content), "analysis_id": source.analysis_id,
+                "scope_version_id": source.scope_version_id, "dataset_version_ids": list(source.dataset_version_ids),
+                "restored_from_id": source.id, "change_kind": "restore",
+                "instruction": "恢复所选报告记录", "summary": "恢复历史记录并采用本研究版本",
+                "conversation_id": getattr(ctx, "conversation_id", None) or ctx.payload.get("conversation_id"),
+                "source_message_id": ctx.payload.get("source_message_id") or ctx.payload.get("message_id")}
+
+    candidate = ctx.step("restore_snapshot", prepare)
+    ctx.check_cancelled()
+    return _complete_candidate(ctx, "restore_candidate", candidate)
 
 
 def render_chart(option, output_path):

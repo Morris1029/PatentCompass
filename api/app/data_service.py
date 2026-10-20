@@ -361,6 +361,30 @@ def _chart_option(title: str, rows: list[dict], kind: str) -> dict:
                         "itemStyle": {"color": "#236b8e"}}]}
 
 
+def _update_analysis_context(session, ctx, analysis, expected_analysis_id=None):
+    research_id = ctx.payload.get("research_id")
+    if research_id:
+        from app import research_service
+        from app.models import Report, ResearchVersion
+        research = session.scalar(select(ResearchVersion).join(Report, ResearchVersion.report_id == Report.id).where(
+            ResearchVersion.id == research_id, Report.project_id == ctx.project_id).with_for_update(of=ResearchVersion))
+        if not research:
+            raise AppError(404, "RESEARCH_NOT_FOUND", "研究版本不存在")
+        current = research_service.context_for(session, research)
+        if expected_analysis_id is not None and current.get("analysis_id") != expected_analysis_id:
+            raise AppError(409, "ANALYSIS_VERSION_CONFLICT", "当前分析已变化，分类纠正未覆盖最新分析",
+                           {"current_analysis_id": current.get("analysis_id")})
+        if current["scope_version_id"] == ctx.scope_version_id and current["dataset_version_ids"] == ctx.dataset_version_ids:
+            research_service.set_context(session, research, analysis_id=analysis.id)
+        return
+    project = session.scalar(select(Project).where(Project.id == ctx.project_id).with_for_update())
+    if expected_analysis_id is not None and project.current_analysis_id != expected_analysis_id:
+        raise AppError(409, "ANALYSIS_VERSION_CONFLICT", "当前分析已变化，分类纠正未覆盖最新分析",
+                       {"current_analysis_id": project.current_analysis_id})
+    if project.scope_version_id == ctx.scope_version_id and ctx.dataset_version_ids == [project.dataset_version_id]:
+        project.current_analysis_id = analysis.id
+
+
 def analyze(ctx) -> dict:
     def calculate():
         with session_scope() as session:
@@ -454,9 +478,7 @@ def analyze(ctx) -> dict:
                     "unavailable": {"province": "样本没有省市或详细地址", "protection": "缺少有效保护地及法律状态",
                                     "family": "没有完整同族数据"}}, ["country"]),
             }
-            project = session.scalar(select(Project).where(Project.id == ctx.project_id).with_for_update())
-            if project.scope_version_id == ctx.scope_version_id and ctx.dataset_version_ids == [project.dataset_version_id]:
-                project.current_analysis_id = analysis.id
+            _update_analysis_context(session, ctx, analysis)
             ctx.guard(session)
             session.flush()
             return _analysis_result(session, analysis)

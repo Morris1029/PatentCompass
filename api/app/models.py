@@ -225,6 +225,24 @@ class Report(Record, Base):
     project_id: Mapped[str] = mapped_column(ForeignKey("projects.id"), unique=True)
     current_version_id: Mapped[str | None] = mapped_column(ForeignKey("report_versions.id", use_alter=True, name="fk_report_current_version"))
     version_counter: Mapped[int] = mapped_column(Integer, default=0)
+    current_research_id: Mapped[str | None] = mapped_column(ForeignKey("research_versions.id", use_alter=True, name="fk_report_current_research"))
+    research_counter: Mapped[int] = mapped_column(Integer, default=0)
+
+
+class ResearchVersion(Record, Base):
+    __tablename__ = "research_versions"
+    report_id: Mapped[str] = mapped_column(ForeignKey("reports.id"), index=True)
+    status: Mapped[str] = mapped_column(String(20), default="draft")
+    number: Mapped[int | None] = mapped_column(Integer)
+    revision: Mapped[int] = mapped_column(Integer, default=0)
+    main_conversation_id: Mapped[str | None] = mapped_column(ForeignKey("conversations.id"), unique=True)
+    base_revision_id: Mapped[str | None] = mapped_column(ForeignKey("report_versions.id", use_alter=True, name="fk_research_base_revision"))
+    initial_revision_id: Mapped[str | None] = mapped_column(ForeignKey("report_versions.id", use_alter=True, name="fk_research_initial_revision"))
+    current_revision_id: Mapped[str | None] = mapped_column(ForeignKey("report_versions.id", use_alter=True, name="fk_research_current_revision"))
+    scope_version_id: Mapped[str | None] = mapped_column(ForeignKey("scope_versions.id"))
+    dataset_version_ids: Mapped[list] = mapped_column(JSONB, default=list)
+    analysis_id: Mapped[str | None] = mapped_column(ForeignKey("analysis_results.id"))
+    __table_args__ = (UniqueConstraint("report_id", "number"),)
 
 
 class ReportVersion(Record, Base):
@@ -241,6 +259,13 @@ class ReportVersion(Record, Base):
     instruction: Mapped[str] = mapped_column(Text, default="")
     summary: Mapped[str] = mapped_column(Text, default="")
     conversation_id: Mapped[str | None] = mapped_column(ForeignKey("conversations.id"))
+    research_id: Mapped[str | None] = mapped_column(ForeignKey("research_versions.id"), index=True)
+    change_kind: Mapped[str] = mapped_column(String(20), default="edit")
+    restored_from_id: Mapped[str | None] = mapped_column(ForeignKey("report_versions.id"))
+    source_message_id: Mapped[str | None] = mapped_column(ForeignKey("messages.id"))
+    operation_id: Mapped[str | None] = mapped_column(Uuid(as_uuid=False), unique=True)
+    change_summary: Mapped[dict] = mapped_column(JSONB, default=dict)
+    change_count: Mapped[int] = mapped_column(Integer, default=0)
     __table_args__ = (UniqueConstraint("report_id", "number"),)
 
 

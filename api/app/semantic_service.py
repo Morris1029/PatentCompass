@@ -13,7 +13,7 @@ from sqlalchemy.dialects.postgresql import insert
 from app import model_provider
 from app.chart_service import ensure_versions, heatmap_snapshot
 from app.config import get_settings
-from app.data_service import COUNTING_METHOD, _analysis_result, _chart_option, _text_hash, search_patents
+from app.data_service import COUNTING_METHOD, _analysis_result, _chart_option, _text_hash, _update_analysis_context, search_patents
 from app.db import session_scope
 from app.errors import AppError
 from app.models import (AnalysisResult, Chart, DatasetVersion, Evidence, PatentApplication, PatentPublication,
@@ -446,12 +446,8 @@ def _persist(ctx, patents, assignments, taxonomy, cached_count, revision_of_id=N
                                 "unavailable": {"province": "样本没有省市或详细地址", "protection": "缺少有效保护地及法律状态",
                                                 "family": "没有完整同族数据"}}, ["country"]),
         }
-        project = session.scalar(select(Project).where(Project.id == ctx.project_id).with_for_update())
-        if revision_of_id and project.current_analysis_id != ctx.payload["expected_current_analysis_id"]:
-            raise AppError(409, "ANALYSIS_VERSION_CONFLICT", "当前分析已变化，分类纠正未覆盖最新分析",
-                           {"current_analysis_id": project.current_analysis_id})
-        if project.scope_version_id == ctx.scope_version_id and ctx.dataset_version_ids == [project.dataset_version_id]:
-            project.current_analysis_id = analysis.id
+        _update_analysis_context(session, ctx, analysis,
+                                 ctx.payload["expected_current_analysis_id"] if revision_of_id else None)
         ctx.guard(session)
         session.flush()
         return {**_analysis_result(session, analysis), **coverage}

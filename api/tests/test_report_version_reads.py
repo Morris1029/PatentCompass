@@ -12,7 +12,7 @@ import pytest
 from sqlalchemy import event
 
 from app.main import create_app
-from app.models import Project, Report, ReportVersion
+from app.models import Project, Report, ReportVersion, ResearchVersion
 from app.report_service import generate_report
 from test_reports import report_analysis
 
@@ -36,6 +36,7 @@ def versions(db_session, project, context_factory, report_analysis):
         content["title"] = f"报告 V{number}"
         content["blocks"][1]["text"] = f"版本 {number} 的正文。"
         version = ReportVersion(report_id=original.report_id, number=number, parent_id=result[-1].id,
+                                research_id=original.research_id,
                                 run_id=context.run_id, analysis_id=original.analysis_id,
                                 scope_version_id=original.scope_version_id, dataset_version_ids=original.dataset_version_ids,
                                 content=content, chart_ids=original.chart_ids, instruction="修改正文",
@@ -45,6 +46,7 @@ def versions(db_session, project, context_factory, report_analysis):
         result.append(version)
     report = db_session.get(Report, original.report_id)
     report.version_counter, report.current_version_id = 5, result[2].id
+    db_session.get(ResearchVersion, original.research_id).current_revision_id = result[2].id
     db_session.flush()
     return result
 
@@ -81,7 +83,9 @@ def test_summary_list_projects_metadata_and_pages_tied_timestamps_in_sql(client,
             page = response.json()
             assert page["total"] == 5 and page["returned_count"] == len(page["items"])
             assert page["current_version_id"] == versions[2].id
-            assert all(set(item) == {"id", "created_at", "number", "parent_id", "summary", "is_current"}
+            assert all(set(item) == {"id", "created_at", "number", "parent_id", "summary", "is_current",
+                       "research_id", "research_number", "main_conversation_id", "source_conversation_id",
+                       "source_message_id", "change_kind", "change_count", "change_summary", "restored_from_id", "conversation_id"}
                        for item in page["items"])
             found.extend(page["items"])
             cursor = page["next_cursor"]
@@ -188,9 +192,13 @@ def test_display_reads_and_adoption_preserve_full_snapshot_and_parent_links(clie
     frozen, parent_id = deepcopy(version.content), version.parent_id
     path = f"/api/reports/{version.report_id}/versions/{version.id}"
     display = client.get(path, params={"view": "display"}).json()
-    switched = client.put(f"/api/reports/{version.report_id}/current-version", json={
-        "version_id": versions[0].id, "expected_current_version_id": versions[2].id})
-    assert switched.status_code == 200, switched.text
+    from app.jobs import execute_run
+    switched = client.post(f"/api/research-versions/{version.research_id}/restore", json={
+        "revision_id": versions[0].id, "expected_current_version_id": versions[2].id,
+        "expected_adopted_version_id": versions[2].id})
+    assert switched.status_code == 202, switched.text
+    execute_run(switched.json()["run_id"])
+    assert client.get(f"/api/runs/{switched.json()['run_id']}").json()["status"] == "succeeded"
     assert client.get(path, params={"view": "display"}).json() == display
     assert client.get(path).json()["content"] == frozen
     db_session.expire_all()

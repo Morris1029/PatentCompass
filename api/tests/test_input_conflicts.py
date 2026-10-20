@@ -175,7 +175,8 @@ def test_explicit_report_edit_button_with_conversation_does_not_ask_again(
     jobs.execute_run(retried["run_id"])
     repeated = client.get(f"/api/runs/{retried['run_id']}").json()
     assert repeated["status"] == "succeeded" and repeated["origin_message_id"] == origin_id
-    messages = client.get(f"/api/conversations/{conversation.id}/messages").json()["items"]
+    main_conversation_id = repeated["result"]["main_conversation_id"]
+    messages = client.get(f"/api/conversations/{main_conversation_id}/messages").json()["items"]
     assert len(messages) == 2 and all(message["run_id"] == retried["run_id"] for message in messages)
 
 
@@ -187,6 +188,9 @@ def test_plan_commit_before_checkpoint_gap_keeps_original_report_pin(client, db_
         "operations": [{"op": "set_title", "text": "Later adopted title"}]}))
     report = db_session.get(Report, first["report_id"])
     report.current_version_id = v1.id
+    from app.models import ResearchVersion
+    research = db_session.get(ResearchVersion, first["research_id"])
+    research.current_revision_id = v1.id
     db_session.flush()
     task = _message(client, project, "修改报告标题")
     payload = dict(db_session.get(ResearchRun, task["run_id"]).payload)
@@ -208,6 +212,7 @@ def test_plan_commit_before_checkpoint_gap_keeps_original_report_pin(client, db_
     old.status = "failed"
     assert old.payload["plan_report_version_id"] == v1.id
     report.current_version_id = second["report_version_id"]
+    research.current_revision_id = second["report_version_id"]
     db_session.flush()
     retry = client.post(f"/api/runs/{old.id}/retry").json()
     retry_context = RunContext(retry["run_id"], "unused-before-claim")
