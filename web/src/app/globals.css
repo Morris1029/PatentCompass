@@ -74,12 +74,29 @@ button:disabled { cursor: default; opacity: .6; }
 .radio-choice { display: flex; align-items: baseline; gap: 9px; margin: 10px 0; font-size: 13px; }
 .radio-choice input { accent-color: var(--accent); }
 .error-notice { color: #934f37; margin: 16px 0; }
-.workspace-shell .home-workbench { width: 100%; max-width: 960px; margin: 0 auto; min-height: calc(100dvh - 64px); padding: 55px 36px 60px; }
-.workspace-shell .home-workbench:not(.has-conversation) { justify-content: center; }
+.workspace-shell .workspace-view-chat { position: fixed; inset-inline: 0; top: var(--chat-viewport-top, 0px); height: var(--chat-viewport-height, 100dvh); overflow: hidden; }
+.workspace-shell .workspace-view-chat .workspace-main { height: 100%; min-height: 0; overflow: hidden; }
+.workspace-shell .workspace-view-chat .home-workbench { display: flex; flex-direction: column; align-items: stretch; justify-content: flex-start; flex: 1 1 0; width: 100%; max-width: none; min-height: 0; margin: 0; padding: 0; overflow: hidden; }
+.chat-scroll { flex: 1 1 0; min-height: 0; overflow-y: auto; overscroll-behavior-y: contain; scrollbar-width: thin; scroll-padding-block: 20px; }
+.chat-scroll:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.chat-scroll-content { width: 100%; max-width: 952px; margin: 0 auto; padding: 30px 36px 20px; }
+.home-workbench:not(.has-conversation) .chat-scroll { display: flex; }
+.home-workbench:not(.has-conversation) .chat-scroll-content { margin-block: auto; }
+.home-workbench:not(.has-conversation) .agent-welcome { margin-inline: auto; }
+.chat-composer-dock { flex: 0 0 auto; padding: 12px 36px calc(16px + env(safe-area-inset-bottom, 0px)); background: #fff; }
+.workspace-shell .workspace-view-chat .agent-composer { display: flex; flex-direction: column; width: 100%; max-width: 880px; max-height: max(90px, min(390px, calc(var(--chat-viewport-height, 100dvh) - 130px - env(safe-area-inset-bottom, 0px)))); margin: 0 auto; padding: 14px 16px 12px; overflow: hidden; }
+.workspace-shell .workspace-view-chat .agent-composer textarea { flex: 0 1 auto; min-height: 1.7em; max-height: 160px; resize: none; overflow-y: auto; }
+.composer-context { flex: 0 1 auto; min-height: 0; max-height: min(160px, calc(var(--chat-viewport-height, 100dvh) * .22)); overflow-y: auto; overscroll-behavior-y: contain; margin-bottom: 10px; }
+.composer-context:empty { display: none; }
+.workspace-shell .workspace-view-chat .agent-composer-actions { flex: 0 0 auto; margin-top: 8px; }
+.workspace-shell .workspace-view-chat .composer-attach, .workspace-shell .workspace-view-chat .composer-send { width: 36px; height: 36px; min-height: 36px; padding: 0; flex: 0 0 auto; }
+.workspace-shell .workspace-view-chat .composer-send { border-radius: 50%; }
+.composer-spinner { animation: composer-spin .8s linear infinite; }
+@keyframes composer-spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) { .composer-spinner { animation: none; } }
 .workspace-shell .agent-welcome { padding-top: 0; margin-bottom: 30px; }
 .workspace-shell .agent-composer { width: 100%; max-width: 880px; }
 .welcome-create { margin-top: 24px; }
-.workspace-shell .home-workbench.has-conversation { display: block; padding-top: 30px; }
 .conversation-thread { display: block; }
 .conversation-message { margin-bottom: 28px; }
 .conversation-message .assistant-content { min-width: 0; width: 100%; }
@@ -292,6 +309,12 @@ button:disabled { cursor: default; opacity: .6; }
   .workspace-topline { padding: 17px 15px 17px 54px; font-size: 12px; min-height: 64px; gap: 7px; }
   .context-status { display: none; }
   .workspace-shell .home-workbench { padding: 30px 20px 40px; }
+  .chat-scroll-content { padding: 24px 20px 18px; }
+  .chat-composer-dock { padding: 8px 20px calc(12px + env(safe-area-inset-bottom, 0px)); }
+  .workspace-shell .workspace-view-chat .agent-composer { padding: 12px 14px 10px; }
+  .workspace-shell .workspace-view-chat .agent-composer textarea { font-size: 16px; }
+  .workspace-shell .workspace-view-chat .task-input input, .workspace-shell .workspace-view-chat .task-input textarea, .workspace-shell .workspace-view-chat .task-input select { font-size: 16px; }
+  .workspace-shell .workspace-view-chat .mobile-nav-toggle { position: absolute; }
   .workspace-shell .agent-welcome { padding-top: 0; }
   .agent-welcome h1 { font-size: 27px; }
   .has-conversation { padding-top: 20px; }

@@ -164,12 +164,6 @@ export function TaskCard({ id: initialId, project, onResult, kinds, presentation
     <ErrorNotice error={error} />
   </>);
 }
-const EMPTY_TASKS: string[] = [];
-export function ProjectTasks({ project, kinds, local, onResult }: { project: Json; kinds: string[]; local?: string; onResult?: (result: Json) => void }) {
-  const stored = useStore(state => state.runs[project.id] || EMPTY_TASKS);
-  const ids = [...new Set([...(local ? [local] : []), ...(project.active_runs || []).map((item: Json) => item.id), ...stored])].slice(0, 12);
-  return <>{ids.map(id => <TaskCard key={id} id={id} project={project} kinds={kinds} onResult={local === id ? onResult : undefined} />)}</>;
-}
 export function Readable({ value }: { value: unknown }) {
   if (value === null || value === undefined || value === "") return null;
   const terms: Record<string, string> = { ...statusLabel, claims: "权利要求", full_text: "完整说明书", legal_status: "法律状态", family: "完整同族", detailed_address: "省市与详细地址", document_type: "文献类型", candidate_requires_review: "相近记录，待人工复核", pending_validation: "待验证", pending_external: "待执行外部补检", not_performed: "尚未执行", completed: "已完成", local_original_text_term_overlap: "本地原文词汇匹配", classified: "已归类", review: "待复核", semantic: "全量语义分类" };

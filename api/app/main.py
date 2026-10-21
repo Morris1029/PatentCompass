@@ -221,6 +221,7 @@ def update_scope(session, project, expected_id, changes, confirmed, research=Non
 def check_reference(session, project, reference):
     if not reference:
         return
+    from app.markdown_text import markdown_visible_text
     version = owned(session, ReportVersion, reference["report_version_id"])
     if session.get(Report, version.report_id).project_id != project.id:
         raise AppError(404, "REFERENCE_NOT_FOUND", "引用不属于当前项目")
@@ -228,14 +229,17 @@ def check_reference(session, project, reference):
         block = next((item for item in version.content.get("blocks", []) if item.get("id") == reference["block_id"]), None)
         if not block:
             raise AppError(404, "BLOCK_NOT_FOUND", "引用段落不存在")
-        if reference.get("text") and reference["text"] not in str(block.get("text", "")):
+        if (reference.get("text") and reference["text"] not in str(block.get("text", ""))
+                and " ".join(reference["text"].split()) not in markdown_visible_text(str(block.get("text", "")))):
             raise AppError(409, "REFERENCE_TEXT_MISMATCH", "引用原文与报告版本不匹配")
     if reference.get("block_ids"):
         selected = [item for item in version.content.get("blocks", []) if item.get("id") in reference["block_ids"]]
         if len(selected) != len(set(reference["block_ids"])):
             raise AppError(404, "BLOCK_NOT_FOUND", "引用正文块不存在")
-        if reference.get("text") and " ".join(reference["text"].split()) not in " ".join(
-                " ".join(str(item.get("text", "")) for item in selected).split()):
+        if (reference.get("text") and " ".join(reference["text"].split()) not in " ".join(
+                " ".join(str(item.get("text", "")) for item in selected).split())
+                and " ".join(reference["text"].split()) not in " ".join(
+                    markdown_visible_text(str(item.get("text", ""))) for item in selected)):
             raise AppError(409, "REFERENCE_TEXT_MISMATCH", "引用文字与报告快照不匹配")
 
 

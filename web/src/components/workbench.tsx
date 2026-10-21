@@ -1,10 +1,11 @@
 "use client";
 import { useEffect, useRef, useState } from "react";
 import { useSearchParams } from "next/navigation";
-import { api, describe, Json, Page, patch, post, put, refresh, useApi } from "@/lib/api";
+import { api, describe, Json, Page, patch, post, put, refresh, terminal, useApi } from "@/lib/api";
+import { startAnalysisConversation } from "@/lib/analysis-conversation";
 import { useStore } from "@/lib/store";
 import { ChartCard } from "./charts";
-import { DataTable, Empty, ErrorNotice, Modal, Readable, TaskCard, ProjectTasks } from "./shared";
+import { DataTable, Empty, ErrorNotice, Modal, Readable, TaskCard } from "./shared";
 import type { Navigate } from "./workspace";
 
 const tabs = [["overview", "概览"], ["analysis", "态势分析"], ["layout", "布局与路线图"], ["scope", "范围与目标"], ["data", "数据与证据"]];
@@ -17,22 +18,42 @@ export default function Workbench({ project, navigate }: { project: Json; naviga
   const { data: technology } = useApi(tab === "analysis" ? `/api/projects/${project.id}/analysis?view=technology${suffix}` : null);
   const track = useStore(s => s.track); const setDraft = useStore(s => s.draft);
   const [runError, setRunError] = useState<unknown>(); const [working, setWorking] = useState(false);
+  const submission = useRef<{ key: string; semantic: boolean; busy: boolean } | undefined>(undefined);
   const [correction, setCorrection] = useState(false);
+  const [correctionRun, setCorrectionRun] = useState<string>(); const [correcting, setCorrecting] = useState(false);
+  const { data: correctionTask, error: correctionTaskError } = useApi(correctionRun ? `/api/runs/${correctionRun}` : null, task => terminal(task?.status) ? 0 : 1500);
+  const correctionPending = correcting || !!correctionRun;
   const [application, setApplication] = useState(""); const [dimension, setDimension] = useState("methods"); const [themes, setThemes] = useState<string[]>([]);
   const [correctionNumber, setCorrectionNumber] = useState("");
   const { data: correctionRecords } = useApi<Page>(correction ? `/api/projects/${project.id}/patents?analysis_id=${analysis?.analysis_id || project.current_analysis_id}&limit=200${correctionNumber ? `&application_number=${encodeURIComponent(correctionNumber)}` : ""}` : null);
   const wrapper = analysis?.data; const data = wrapper?.data;
   const start = async (semantic = false) => {
+    if (submission.current?.busy) return;
+    if (!submission.current || submission.current.semantic !== semantic) submission.current = { key: crypto.randomUUID(), semantic, busy: false };
+    submission.current.busy = true;
     setWorking(true); setRunError(undefined);
-    try { const task = await post(`/api/projects/${project.id}/runs`, { action: "analyze", semantic_mode: semantic ? "full" : "off", ...(project.research_id ? { research_id: project.research_id } : {}) }); track(project.id, task.run_id); await refresh(); }
-    catch (e) { setRunError(e); } finally { setWorking(false); }
+    try {
+      const task = await startAnalysisConversation(project as { id: string }, semantic, submission.current.key, post);
+      track(project.id, task.run_id); await refresh();
+      navigate({ view: "chat", conversation: task.conversation_id, research: project.research_id || null, message: task.message_id || null, version: null, diff: null, anchor: null });
+      submission.current = undefined;
+    }
+    catch (e) { setRunError(e); } finally { if (submission.current) submission.current.busy = false; setWorking(false); }
   };
   const bring = async (text: string) => { try { const conversationId = project.main_conversation_id || (project.research_id ? (await post(`/api/research-versions/${project.research_id}/conversation`)).conversation_id : null); const key = `${project.id}:${conversationId || "draft"}`; setDraft(key, { content: [useStore.getState().drafts[key]?.content, text].filter(Boolean).join("\n\n") }); navigate({ view: "chat", research: project.research_id || null, conversation: conversationId, version: null, diff: null, anchor: null, message: null }); } catch (e) { setRunError(e); } };
   const scopeConfirmed = project.scope?.confirmed;
   const taxonomy = technology?.data?.data?.taxonomy || {};
+  useEffect(() => {
+    if (!correctionRun || correctionTask?.id !== correctionRun || !terminal(correctionTask.status)) return;
+    setCorrectionRun(undefined);
+    if (correctionTask.status === "succeeded") { setCorrection(false); setRunError(undefined); refresh(); }
+    else setRunError(new Error(correctionTask.error?.message || (correctionTask.status === "cancelled" ? "分类修订已停止，当前输入已保留。" : "分类修订失败，当前输入已保留。")));
+  }, [correctionRun, correctionTask]);
   const correct = async () => {
-    try { const result = await post(`/api/projects/${project.id}/analysis/revisions`, { base_analysis_id: analysis?.analysis_id, expected_current_analysis_id: project.current_analysis_id, ...(project.research_id ? { research_id: project.research_id } : {}), corrections: [{ application_id: application, dimension, theme_ids: themes }] }); if (result.run_id) track(project.id, result.run_id); setCorrection(false); await refresh(); }
-    catch (e) { setRunError(e); }
+    if (correctionPending) return;
+    setCorrecting(true); setRunError(undefined);
+    try { const result = await post(`/api/projects/${project.id}/analysis/revisions`, { base_analysis_id: analysis?.analysis_id, expected_current_analysis_id: project.current_analysis_id, ...(project.research_id ? { research_id: project.research_id } : {}), corrections: [{ application_id: application, dimension, theme_ids: themes }] }); if (result.run_id) { track(project.id, result.run_id); setCorrectionRun(result.run_id); } await refresh(); }
+    catch (e) { setRunError(e); } finally { setCorrecting(false); }
   };
   return <section className="page wide workbench-view" aria-label="分析工作台"><div className="workbench-tabs" role="tablist" aria-label="工作台内容">{tabs.map(([value, label]) => <button key={value} type="button" role="tab" id={`tab-${value}`} aria-selected={tab === value} aria-controls={`panel-${value}`} className={tab === value ? "active" : ""} onClick={() => navigate({ tab: value })}>{label}</button>)}</div>
     <div role="tabpanel" id={`panel-${tab}`} aria-labelledby={`tab-${tab}`} className="workbench-panel">
@@ -40,8 +61,7 @@ export default function Workbench({ project, navigate }: { project: Json; naviga
         <div className="section-head analysis-page-heading"><div><span className="label">项目研究底稿</span><h2>{tab === "layout" ? "布局与路线图" : tab === "overview" ? "研究概览" : "态势分析"}</h2></div><div className="actions"><button className="btn secondary" disabled={working || !project.dataset_version_id} onClick={() => start(false)}>统计分析</button><button className="btn primary" disabled={working || !project.dataset_version_id} onClick={() => start(true)}>{working ? "提交中" : "完整语义分析"}</button></div></div>
         {!scopeConfirmed && <p className="notice">研究范围尚未确认。任务会在执行前请你确认口径。<button className="text-button" onClick={() => navigate({ tab: "scope" })}>完善范围 →</button></p>}
         {analysis?.snapshot_status === "stale" && <p className="notice">当前分析基于历史范围或数据版本；修改后的项目条件需要重新计算。历史成果仍可查看。</p>}
-        <ErrorNotice error={error || runError} />
-        <ProjectTasks project={project} kinds={["analyze", "auto", "revise_analysis"]} />
+        <ErrorNotice error={error || runError || correctionTaskError} />
         {tab === "analysis" && <nav className="workbench-analysis-tabs workspace-nav" aria-label="分析视角">{perspectives.map(([value, label]) => <button key={value} className={perspective === value ? "active" : ""} onClick={() => navigate({ analysis: value })}>{label}</button>)}</nav>}
         {!analysis?.analysis_id ? <Empty title="研究结果尚未生成"><p>先导入并选择专利数据，再运行统计分析或完整语义分析。</p><button className="btn secondary" onClick={() => navigate({ tab: "data" })}>准备专题数据</button></Empty> : <>
           {wrapper?.status === "unavailable" ? <Empty title="此分析视角暂不可用"><p>{wrapper.reason}</p></Empty> : <>
@@ -56,7 +76,7 @@ export default function Workbench({ project, navigate }: { project: Json; naviga
         </>}
       </>}
     </div>
-    {correction && <Modal title="纠正逐条分类归属" close={() => setCorrection(false)}><label className="form-field">定位申请号<input value={correctionNumber} onChange={e => setCorrectionNumber(e.target.value)} placeholder="输入原申请号定位记录" /></label><label className="form-field">申请记录<select value={application} onChange={e => setApplication(e.target.value)}><option value="">选择记录</option>{(correctionRecords?.items || []).map((item: Json) => <option key={item.id} value={item.id}>{item.application_number} · {item.title?.slice(0, 60)}</option>)}</select></label><label className="form-field">维度<select value={dimension} onChange={e => { setDimension(e.target.value); setThemes([]); }}><option value="elements">基础要素</option><option value="methods">技术方法</option><option value="scenarios">应用场景</option></select></label>{(taxonomy[dimension] || []).map((theme: Json) => <label className="radio-choice" key={theme.id}><input type="checkbox" checked={themes.includes(theme.id)} onChange={e => setThemes(current => e.target.checked ? [...current, theme.id] : current.filter(id => id !== theme.id))} />{theme.label}</label>)}<p className="small muted">确认后产生新的分析版本，重新计算统计；历史报告保持原有快照。</p><button className="btn primary" onClick={correct} disabled={!application}>保存分类修订</button><ErrorNotice error={runError} /></Modal>}
+    {correction && <Modal title="纠正逐条分类归属" close={() => setCorrection(false)}><fieldset disabled={correctionPending}><label className="form-field">定位申请号<input value={correctionNumber} onChange={e => setCorrectionNumber(e.target.value)} placeholder="输入原申请号定位记录" /></label><label className="form-field">申请记录<select value={application} onChange={e => setApplication(e.target.value)}><option value="">选择记录</option>{(correctionRecords?.items || []).map((item: Json) => <option key={item.id} value={item.id}>{item.application_number} · {item.title?.slice(0, 60)}</option>)}</select></label><label className="form-field">维度<select value={dimension} onChange={e => { setDimension(e.target.value); setThemes([]); }}><option value="elements">基础要素</option><option value="methods">技术方法</option><option value="scenarios">应用场景</option></select></label>{(taxonomy[dimension] || []).map((theme: Json) => <label className="radio-choice" key={theme.id}><input type="checkbox" checked={themes.includes(theme.id)} onChange={e => setThemes(current => e.target.checked ? [...current, theme.id] : current.filter(id => id !== theme.id))} />{theme.label}</label>)}<p className="small muted">确认后产生新的分析版本，重新计算统计；历史报告保持原有快照。</p><button className="btn primary" onClick={correct} disabled={!application || correctionPending}>{correctionPending ? "正在保存…" : "保存分类修订"}</button></fieldset>{correctionPending && <p className="small muted" role="status">正在保存分类修订，完成后刷新分析结果。</p>}<ErrorNotice error={runError || correctionTaskError} /></Modal>}
   </section>;
 }
 function Metric({ label, value }: { label: string; value: React.ReactNode }) { return <div className="metric"><span>{label}</span><strong>{value ?? "—"}</strong></div>; }
