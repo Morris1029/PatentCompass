@@ -89,7 +89,7 @@ uv run --project api --frozen python examples/capabilities.py
 
 异步 HTTP 调用需要 `Idempotency-Key`，返回 `202` 与 `run_id/status`；MCP 异步工具使用 `request` 加 `idempotency_key` 参数。任务状态、事件、取消和重试复用现有运行记录。独立报告构建和改写只产生内容，不自动发布或采用项目报告版本。完整输入、输出、示例和边界见[组件说明](../docs/capabilities.md)。
 
-独立 `patentcompass_agent/` 提供主 Agent Prompt、五项 Skills 和共享专业指令。新对话的内置运行层完整读取主 Prompt，按需加载 Skills，并与 MCP 共用 `tool_service` 参数契约及后端业务实现；专业判断由宿主模型完成。MCP 总计 39 项工具，包含 16 项项目/外部推理工具和三项技能发现/读取工具。`start_agent_task` 复用原报告发布、修改、图表与导出脚本，可在原前端查看同一成果。原运行恢复和无模型时的显式统计功能保留。配置、打包和验证边界见[迁移说明](../docs/portable-agent.md)。
+独立 `patentcompass_agent/` 提供主 Agent Prompt、六项 Skills 和共享专业指令。新对话的内置运行层完整读取主 Prompt，按需加载 Skills，并与 MCP 共用 `tool_service` 参数契约及后端业务实现；专业判断由宿主模型完成。MCP 总计 40 项工具，包含 17 项项目/外部推理工具和三项技能发现/读取工具。`start_agent_task` 复用原报告发布、修改、图表与导出脚本，可在原前端查看同一成果。原运行恢复和无模型时的显式统计功能保留。配置、打包和验证边界见[迁移说明](../docs/portable-agent.md)。
 
 ## 接口与最小使用流程
 

@@ -246,7 +246,8 @@ def execute_run(run_id: str):
         from app import chart_service, data_service, materials_service, merge_service, orchestration, report_service, semantic_service
         from app.capability_service import execute_capability
         from app.agent_service import execute_analysis
-        handlers = {"agent_analysis": execute_analysis, "capability": execute_capability, "import": data_service.import_dataset, "analyze": run_analysis,
+        from app.strategy_service import persist_strategy
+        handlers = {"agent_analysis": execute_analysis, "agent_strategy": persist_strategy, "capability": execute_capability, "import": data_service.import_dataset, "analyze": run_analysis,
                     "index": data_service.build_embeddings, "generate_report": report_service.generate_report,
                     "revise_report": report_service.revise_report, "restore_report": report_service.restore_report, "export": report_service.export_report,
                     "chat": _chat, "auto": orchestration.execute, "parse_material": materials_service.parse_material,

@@ -2,7 +2,7 @@
 
 从左下角用户头像展开菜单，选择“运行管理”。此入口仅提供配置查看和运行追踪，不写入 Prompt、Skills 或 MCP 连接配置。没有选择项目时也可以使用。
 
-页面包含总览、Agent、MCP、Skills、运行记录。配置从统一的 `patentcompass_agent` 加载器、`tool_service.catalogue()` 和内置运行层 `definitions()` 读取，工具数量随实际注册结果变化。当前有一个主 Agent、五项 Skills、39 项 MCP 工具、26 项内置 Agent 工具；`prepare_agent_action` 是宿主专用工具。
+页面包含总览、Agent、MCP、Skills、运行记录。配置从统一的 `patentcompass_agent` 加载器、`tool_service.catalogue()` 和内置运行层 `definitions()` 读取，工具数量随实际注册结果变化。当前有一个主 Agent、六项 Skills、40 项 MCP 工具、27 项内置 Agent 工具；`prepare_agent_action` 是宿主专用工具。
 
 主 Prompt 与原系统宿主适配 Prompt 分别展示原文、来源、SHA-256 和复制入口。Skills 支持查看 `SKILL.md` 和受控参考文件。MCP 展示后端挂载的 Streamable HTTP 端点及工具参数 Schema。“已配置”仅表示必要参数齐全，不代表模型服务或外部 MCP 客户端已验证连通。
 
@@ -30,6 +30,8 @@
 - 前端 62 项通过，TypeScript 类型检查通过。
 - 浏览器验证使用实际运行的前端/API/worker：桌面 1440×900、侧栏收起、390×844 窄屏、键盘菜单、Prompt 和 Schema 换行、原草稿恢复、浏览器前进后退及刷新。
 - 已有真实任务用于验证历史快照和 Word 链接；新增问答通过原对话界面发送并确认，实际模型为 `qwen3.7-plus`。轨迹与截图保存在 `storage/acceptance/management-20261115/`。
-- 首次问答复用了冻结报告上下文，没有调用专利检索；该记录保留，随后用明确要求实际检索的问答验证工具调用。原对话产物卡片存在重复 React key 警告，本次没有修改该渲染逻辑。
+- 首次问答复用了冻结报告上下文，没有调用专利检索；该记录保留，随后用明确要求实际检索的问答验证工具调用。最初验收时记录的原对话产物卡片重复 React key 警告，已在后续平台完善中修复：同一报告版本合并展示，保留导出链接。
 
 本功能不需要数据库迁移。API 和 worker 需加载更新后的模块；现有任务及持久化数据保持保留。
+
+后续候选方向与路线图完善及运行问题修复，见 [平台完善验收](plans/2026-11-15-agent-research-completion.md)。

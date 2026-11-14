@@ -1,0 +1,6 @@
+import type { ReactNode } from "react";
+import type { Json } from "@/lib/api";
+
+export default function ResearchStrategy({ item, children }: { item: Json; children?: ReactNode }) {
+  return <article className="analysis-surface research-strategy"><div className="section-head"><h3>{item.priority} · {item.title}</h3><span className="status-chip">{item.basis === "mock" ? "模拟方案" : "研究建议 · 待验证"}</span></div><p>{item.description}</p><p className="small muted">{item.provenance?.label || "基于样本的核查计划"} · 原文支持 {item.support_count ?? 0} 条 · 外部验证尚未完成</p><h4>推进条件</h4><ul>{(item.conditions || []).map((text: string, index: number) => <li key={index}>{text}</li>)}</ul><div className="strategy-phases">{(item.phases || []).map((phase: Json, index: number) => <section key={phase.id}><span className="label">阶段 {index + 1}</span><h4>{phase.title}</h4><ul>{(phase.actions || []).map((action: Json, i: number) => <li key={action.id || i}>{action.title || String(action)}</li>)}</ul>{phase.deliverable && <p><strong>交付物：</strong>{phase.deliverable}</p>}{(phase.acceptance || phase.conditions?.length) && <p><strong>验收条件：</strong>{phase.acceptance || phase.conditions.join("；")}</p>}</section>)}</div><h4>风险关注</h4><ul>{(item.risks || []).map((risk: Json, index: number) => <li key={risk.id || index}>{risk.title || String(risk)}</li>)}</ul>{children}</article>;
+}

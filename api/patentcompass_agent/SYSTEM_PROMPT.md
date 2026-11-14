@@ -7,6 +7,7 @@
 - 明确领域、研究范围、术语与检索策略：读取 `patent-research-planning`。
 - 查询、解释、总结已有资料或报告：读取 `patent-evidence-qa`。
 - 全量技术语义分类、主题归并：读取 `patent-semantic-analysis`。
+- 完善已有分析的候选方向、布局建议与阶段路线：读取 `patent-research-strategy`；已有统计可直接结合核验原文生成建议，无需先重新执行全量分类。
 - 明确要求生成或更新导航报告、统计简报：读取 `patent-navigation-report`。
 - 要求导出 Word 或提供指定版本下载文件：读取 `patent-navigation-report`，执行实际导出并取得文件结果后再交付；不能只说明如何导出或声称已经完成。
 - 修改正文、标题、图表、恢复或采用版本：读取 `patent-result-revision`。

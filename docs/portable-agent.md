@@ -13,7 +13,7 @@ BUILTIN_RUNTIME.md 仅说明原系统宿主的确认、固定上下文和子任�
 ## 文件和运行依赖
 
 - `api/patentcompass_agent/SYSTEM_PROMPT.md`：可迁移主 Agent 指令。
-- `api/patentcompass_agent/skills/`：五项业务技能及专业 Prompt。
+- `api/patentcompass_agent/skills/`：六项业务技能及专业 Prompt。
 - `scripts/package-agent.py`：生成独立迁移 ZIP，默认 `storage/patentcompass-agent.zip`。
 - 后端沿用 `scripts/start-dev.ps1`。API 的 MCP 地址是 `http://127.0.0.1:8000/mcp/`，Streamable HTTP。
 
@@ -66,7 +66,7 @@ Codex 的 AGENTS.md 是工作区指令，不是替换平台自身的最高级系
 
 原 16 个能力工具及 get_run / get_run_events / cancel_run / retry_run 保留。search_patents、read_analysis、get_evidence、get_report_version 等仍用于数据读取。
 
-另有 list_agent_skills / load_agent_skill / read_agent_reference 三项只读技能工具，合计 39 项 MCP 工具。内置宿主另提供 prepare_agent_action 适配原确认界面；这不是另一套业务实现，实际分析、检索、报告、图表和导出仍调用共用工具服务。
+另有 list_agent_skills / load_agent_skill / read_agent_reference 三项只读技能工具，合计 40 项 MCP 工具。内置宿主另提供 prepare_agent_action 适配原确认界面；这不是另一套业务实现，实际分析、检索、报告、图表和导出仍调用共用工具服务。
 
 ### 最小请求示例
 
@@ -111,3 +111,7 @@ Codex 的 AGENTS.md 是工作区指令，不是替换平台自身的最高级系
 ### 外部平台
 
 自动测试使用独立 PostgreSQL 测试库，禁止后端生成模型调用，验证外部结果提交到原业务版本闭环；MCP 协议测试覆盖工具发现、Schema、错误和实际调用。它们证明协议和业务可运行，不等于两个客户端的安装界面已经实测。实际接入时各执行一次同数据/同范围的“语义分析 → 报告 → 修改 → 指定版导出”，比较计数、覆盖、证据、版本关系与文件，不比较模型措辞。
+
+## 候选方向与阶段方案
+
+`patent-research-strategy` 使用固定分析和核验原文形成研究建议，通过共享 `save_research_strategy` 保存新分析版本。原统计、图表、报告历史保留，工作台与报告共用方案；这不代表已完成全量语义分类。支持明确授权的 mock 方案，模拟项不带真实证据，支持数为零，并在页面与报告标注。

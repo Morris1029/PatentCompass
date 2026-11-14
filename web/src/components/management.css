@@ -106,3 +106,9 @@
   .sidebar-is-collapsed .account-chevron { display: initial; }
   .sidebar-is-collapsed .account-trigger { padding: 10px 8px; justify-content: start; }
 }
+
+.strategy-phases { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 240px), 1fr)); gap: 16px; margin: 20px 0; }
+.strategy-phases > section { background: #f5faf7; padding: 18px; border: 1px solid #dcece4; border-radius: 10px; min-width: 0; }
+.research-strategy { margin-bottom: 20px; overflow-wrap: anywhere; }
+.research-strategy h4 { font-size: 14px; margin: 16px 0 10px; }
+.research-strategy li, .strategy-phases p { font-size: 13px; line-height: 1.8; }

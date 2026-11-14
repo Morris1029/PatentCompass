@@ -94,6 +94,8 @@ def _prepare(ctx, arguments):
 
 
 def _required_skill(name, arguments):
+    if name == "save_research_strategy":
+        return "patent-research-strategy"
     if "semantic" in name:
         return "patent-semantic-analysis"
     if name == "start_agent_task":
@@ -121,7 +123,7 @@ def _scope_tool(ctx, state, name, arguments):
         raise AppError(404, "PROJECT_NOT_FOUND", "工具目标不属于此对话")
     if request.get("research_id") and str(request["research_id"]) != ctx.payload.get("research_id"):
         raise AppError(409, "RESEARCH_TARGET_CHANGED", "请先通过本轮确认选择研究归属")
-    if name in {"get_agent_context", "start_semantic_analysis", "start_agent_task"} and ctx.payload.get("research_id"):
+    if name in {"get_agent_context", "start_semantic_analysis", "start_agent_task", "save_research_strategy"} and ctx.payload.get("research_id"):
         if request.get("research_id") != ctx.payload["research_id"]:
             raise AppError(409, "RESEARCH_TARGET_REQUIRED", "请传入本轮已绑定的研究标识")
     if name in {"get_run", "get_run_events", "cancel_run", "retry_run", "get_semantic_batch",
@@ -178,8 +180,13 @@ def _scope_tool(ctx, state, name, arguments):
             if action not in allowed:
                 raise AppError(409, "ACTION_NOT_AUTHORIZED", "工具操作与本轮已确认目标不一致")
             expected = ctx.payload.get("target_version_id") or ctx.payload.get("plan_report_version_id")
+            if action == "revise_report" and not request.get("base_version_id"):
+                raise AppError(422, "REPORT_BASE_REQUIRED", "修改报告需要传入 base_version_id；expected_current_version_id 不能代替基础版本。",
+                    {"base_version_id": expected, "expected_current_version_id": expected})
             if action == "revise_report" and request.get("base_version_id") != expected:
-                raise AppError(409, "REPORT_TARGET_CHANGED", "修改目标必须是本轮确认的报告版本")
+                raise AppError(409, "REPORT_TARGET_CHANGED", "修改目标必须是本轮确认的报告版本", {"base_version_id": expected})
+            if action == "export" and not request.get("report_version_id"):
+                raise AppError(422, "REPORT_VERSION_REQUIRED", "导出需要传入 report_version_id。", {"report_version_id": expected})
             approved_operations = ctx.payload["plan"].get("operations", [])
             if action == "revise_report" and approved_operations:
                 from app.schemas import ReportOperation
@@ -207,6 +214,29 @@ def _scope_tool(ctx, state, name, arguments):
         if request["action"] == "analyze" and ctx.payload.get("semantic_mode") == "full":
             raise AppError(409, "SEMANTIC_ANALYSIS_REQUIRED", "本轮要求全量语义分析，请采用语义批次工具")
         require_execution(ctx, [request["action"]])
+    elif name == "save_research_strategy":
+        if ctx.payload["plan"]["action"] != "analyze" or request["analysis_id"] != ctx.payload.get("analysis_id"):
+            raise AppError(409, "STRATEGY_TARGET_MISMATCH", "请先确认完善当前分析的研究方案")
+        require_execution(ctx, ["analyze"])
+
+
+def _collect_child(ctx, state, child_id):
+    with session_scope() as session:
+        parent = ctx.guard(session)
+        child = owned(session, ResearchRun, child_id)
+        if child.project_id != ctx.project_id or child_id not in state["children"]:
+            raise AppError(404, "RUN_NOT_FOUND", "任务不属于本轮执行")
+        artifacts = {key: item for key, item in child.result.items() if key in _ARTIFACTS} if child.status == "succeeded" else {}
+        changed = any(state["artifacts"].get(key) != value for key, value in artifacts.items())
+        state["artifacts"].update(artifacts)
+        if artifacts.get("analysis_id") and parent.payload.get("analysis_id") != artifacts["analysis_id"]:
+            parent.payload = {**parent.payload, "analysis_id": artifacts["analysis_id"]}
+            ctx.payload = dict(parent.payload)
+        status = child.status
+        action = child.payload.get("action") or {"agent_analysis": "analyze", "agent_strategy": "strategy"}.get(child.kind, child.kind)
+    if changed:
+        ctx.emit("artifact.ready", artifacts)
+    ctx.emit("activity.updated", {"id": child_id, "kind": action, "status": status, **artifacts})
 
 
 def _invoke(ctx, state, name, arguments, call_id):
@@ -224,8 +254,8 @@ def _invoke(ctx, state, name, arguments, call_id):
     with session_scope() as session:
         ctx.guard(session)
         value = public_value(jsonable_encoder(tool_service.invoke(session, name, arguments)))
-        child_id = value.get("run_id") if isinstance(value, dict) else None
-        if child_id and name in {"start_semantic_analysis", "start_agent_task", "retry_run"}:
+        child_id = arguments.get("run_id") if name in {"get_run", "get_run_events"} else value.get("run_id") if isinstance(value, dict) else None
+        if child_id and name in {"start_semantic_analysis", "start_agent_task", "save_research_strategy", "retry_run"}:
             child = owned(session, ResearchRun, child_id, lock=True)
             child.payload = {**child.payload, "parent_run_id": ctx.run_id,
                 "conversation_id": ctx.conversation_id, "source_message_id": ctx.payload["message_id"]}
@@ -233,7 +263,7 @@ def _invoke(ctx, state, name, arguments, call_id):
     if name in {"search_patents", "search_materials"}:
         ctx.emit("activity.updated", {"id": call_id, "kind": name, "status": "succeeded", "matched_count": value.get("matched_count", 0)})
         ctx.emit("evidence.ready", {"records": value.get("items", value.get("records", [])), "matched_count": value.get("matched_count", 0)})
-    if child_id and name in {"start_semantic_analysis", "start_agent_task", "retry_run"}:
+    if child_id and name in {"start_semantic_analysis", "start_agent_task", "save_research_strategy", "retry_run"}:
         if child_id not in state["children"]:
             state["children"].append(child_id)
     if name == "load_agent_skill":
@@ -243,25 +273,13 @@ def _invoke(ctx, state, name, arguments, call_id):
         if value["name"] not in state["skills"]:
             raise AppError(422, "SKILL_REQUIRED", "请先加载对应技能")
         state["skills"][value["name"]]["references"][value["resource"]] = value["content"]
-    if child_id and name in {"start_agent_task", "finish_semantic_analysis", "retry_run"}:
+    if child_id and name in {"start_agent_task", "finish_semantic_analysis", "save_research_strategy", "retry_run"}:
         from app.jobs import execute_run
         action = arguments.get("request", {}).get("action", "analyze")
-        ctx.emit("activity.updated", {"id": call_id, "kind": action, "status": "running"})
+        ctx.emit("activity.updated", {"id": child_id, "kind": action, "status": "running"})
         execute_run(child_id)
-        artifacts = None
-        with session_scope() as session:
-            child = owned(session, ResearchRun, child_id)
-            if child.status == "succeeded":
-                artifacts = {key: item for key, item in child.result.items() if key in _ARTIFACTS}
-                state["artifacts"].update(artifacts)
-                if artifacts.get("analysis_id"):
-                    parent = ctx.guard(session)
-                    parent.payload = {**parent.payload, "analysis_id": artifacts["analysis_id"]}
-                    ctx.payload = dict(parent.payload)
-            status = child.status
-        if artifacts is not None:
-            ctx.emit("artifact.ready", artifacts)
-        ctx.emit("activity.updated", {"id": call_id, "kind": action, "status": status, **(artifacts or {})})
+    if child_id and child_id in state["children"] and name in {"start_agent_task", "finish_semantic_analysis", "save_research_strategy", "retry_run", "get_run", "get_run_events"}:
+        _collect_child(ctx, state, child_id)
     return value
 
 

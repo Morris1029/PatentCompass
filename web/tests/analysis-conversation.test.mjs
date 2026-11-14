@@ -52,3 +52,16 @@ test("retry after a lost conversation response reuses the same creation key", as
   assert.deepEqual(requests[0], requests[1]);
   assert.equal(task.run_id, "same-run");
 });
+
+test("strategy completion uses the original research conversation without requesting full reclassification", async () => {
+  const calls = [];
+  const result = await startAnalysisConversation({ id: "project", research_id: "research", main_conversation_id: "main" }, "strategy", "strategy-key", async (...args) => {
+    calls.push(args); return { run_id: "strategy" };
+  });
+  assert.equal(calls[0][0], "/api/conversations/main/messages");
+  assert.equal(calls[0][1].action, "auto");
+  assert.equal(calls[0][1].semantic_mode, "off");
+  assert.match(calls[0][1].content, /交付物和验收条件/);
+  assert.match(calls[0][1].content, /不伪造/);
+  assert.equal(result.conversation_id, "main");
+});

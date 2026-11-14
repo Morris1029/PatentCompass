@@ -83,6 +83,12 @@ def retry_run(session, run_id):
         raise AppError(409, "RUN_NOT_FAILED", "只能重试失败任务")
     run = create_run(session, old.kind, payload=dict(old.payload), conversation_id=old.conversation_id, retry_of_id=old.id)
     run.project_id, run.scope_version_id, run.dataset_version_ids = old.project_id, old.scope_version_id, list(old.dataset_version_ids)
+    # Rebind in the retry transaction, before the new worker can start or the
+    # caller can cancel the queued retry. Completed children remain historical.
+    children = session.scalars(select(ResearchRun).where(ResearchRun.owner_id == old.owner_id,
+        ResearchRun.payload["parent_run_id"].astext == old.id, ResearchRun.status.not_in(TERMINAL)).with_for_update()).all()
+    for child in children:
+        child.payload = {**child.payload, "parent_run_id": run.id}
     origin = session.get(Message, old.payload["message_id"]) if old.payload.get("message_id") else session.scalar(
         select(Message).where(Message.run_id == old.id, Message.role == "user"))
     if origin and origin.role == "user" and origin.conversation_id == old.conversation_id:

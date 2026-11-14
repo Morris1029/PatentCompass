@@ -36,8 +36,8 @@ def test_configuration_uses_actual_shared_loaders_and_never_returns_secrets(clie
     assert data["skills"] == list_skills()
     assert data["agent"]["tools"] == agent_runtime.definitions()
     from app.tool_service import catalogue
-    assert len(data["mcp"]["tools"]) == len(catalogue()) == 39
-    assert len(data["agent"]["tools"]) == 26
+    assert len(data["mcp"]["tools"]) == len(catalogue()) == 40
+    assert len(data["agent"]["tools"]) == 27
     assert "prepare_agent_action" not in {item["name"] for item in data["mcp"]["tools"]}
     assert not {"PRIVATE-TOKEN", "private.invalid", "password"}.intersection(json.dumps(data).split())
     assert "PRIVATE-TOKEN" not in json.dumps(data) and "private.invalid" not in json.dumps(data)

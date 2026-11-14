@@ -94,10 +94,10 @@ class ProjectTask(ProjectRef):
     action: Literal["analyze", "generate_report", "revise_report", "restore_report", "export", "revise_chart"]
     expected_revision: int = Field(ge=0)
     analysis_id: UUID | None = None
-    expected_current_version_id: UUID | None = None
+    expected_current_version_id: UUID | None = Field(default=None, description="Expected current report or chart version; this concurrency check does not replace base_version_id.")
     expected_adopted_version_id: UUID | None = None
-    base_version_id: UUID | None = None
-    report_version_id: UUID | None = None
+    base_version_id: UUID | None = Field(default=None, description="Required for revise_report and revise_chart: the exact version being edited.")
+    report_version_id: UUID | None = Field(default=None, description="Required for export or restore_report: the exact frozen report version to export or restore.")
     chart_id: UUID | None = None
     chart_mode: Literal["style", "data", "insight"] = "style"
     chart_option: dict = Field(default_factory=dict)
@@ -110,3 +110,33 @@ class ProjectTask(ProjectRef):
 class ResearchAdopt(Input):
     research_id: UUID
     expected_current_version_id: UUID | None
+
+
+class StrategyEvidence(Input):
+    application_id: UUID
+    quote: str = Field(min_length=5, max_length=1200)
+
+
+class StrategyPhase(Input):
+    title: str = Field(min_length=1, max_length=100)
+    actions: list[str] = Field(min_length=1, max_length=6)
+    deliverable: str = Field(min_length=1, max_length=500)
+    acceptance: str = Field(min_length=1, max_length=500)
+
+
+class StrategyDirection(Input):
+    title: str = Field(min_length=1, max_length=150)
+    description: str = Field(min_length=1, max_length=2000)
+    basis: Literal["evidence", "mock"] = "evidence"
+    evidence: list[StrategyEvidence] = Field(default_factory=list, max_length=12)
+    risks: list[str] = Field(min_length=1, max_length=8)
+    conditions: list[str] = Field(min_length=1, max_length=8)
+    phases: list[StrategyPhase] = Field(min_length=2, max_length=4)
+
+
+class StrategySave(ProjectRef):
+    expected_revision: int = Field(ge=0)
+    analysis_id: UUID
+    agent_model: str = Field(min_length=1, max_length=150)
+    allow_mock: bool = False
+    directions: list[StrategyDirection] = Field(min_length=1, max_length=6)

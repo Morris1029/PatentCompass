@@ -415,3 +415,46 @@ def test_explicit_message_action_cannot_be_downgraded_to_chat():
     with pytest.raises(AppError) as error:
         agent_runtime._prepare(SimpleNamespace(payload={}, kind="analyze"), _plan("chat"))
     assert error.value.code == "ACTION_NOT_AUTHORIZED"
+
+
+def test_polling_a_child_completed_by_another_worker_collects_parent_artifacts(db_session, source, context_factory):
+    parent = context_factory(source, "auto", {"plan": {"action": "generate_report"}})
+    child = jobs.create_run(db_session, "generate_report", source, {"parent_run_id": parent.run_id})
+    child.status = "succeeded"
+    child.result = {"analysis_id": str(uuid4()), "report_version_id": str(uuid4()), "file_id": str(uuid4())}
+    db_session.flush()
+    state = {"skills": {}, "children": [child.id], "artifacts": {}}
+    result = agent_runtime._invoke(parent, state, "get_run", {"run_id": child.id}, "poll-child")
+    assert result["status"] == "succeeded"
+    assert state["artifacts"] == child.result
+    assert parent.payload["analysis_id"] == child.result["analysis_id"]
+    assert any(event.event_type == "artifact.ready" for event in db_session.scalars(
+        select(RunEvent).where(RunEvent.run_id == parent.run_id)))
+
+
+def test_cancel_retry_before_worker_starts_cancels_old_waiting_child(db_session, source, context_factory):
+    parent = context_factory(source, "auto")
+    child = jobs.create_run(db_session, "agent_analysis", source, {"parent_run_id": parent.run_id})
+    child.status, child.dispatch_pending = "waiting_input", False
+    old = db_session.get(ResearchRun, parent.run_id)
+    old.status = "failed"
+    old.payload = {"agent_runtime_version": 1, "agent_runtime": {"children": [child.id]}}
+    db_session.flush()
+    retry = task_service.retry_run(db_session, parent.run_id)
+    assert child.payload["parent_run_id"] == retry["run_id"]
+    task_service.cancel_run(db_session, retry["run_id"])
+    assert child.status == "cancelled" and child.cancellation_requested
+
+
+def test_missing_report_base_has_actionable_feedback_without_relaxing_target(db_session, source, context_factory):
+    version = str(uuid4())
+    ctx = context_factory(source, "auto", {"plan": {"action": "revise_report"}, "plan_report_version_id": version})
+    state = {"skills": {"patent-result-revision": {}}, "children": []}
+    with pytest.raises(AppError) as error:
+        agent_runtime._scope_tool(ctx, state, "start_agent_task", {"request": {
+            "project_id": source.id, "action": "revise_report", "expected_current_version_id": version}})
+    assert error.value.code == "REPORT_BASE_REQUIRED" and error.value.details["base_version_id"] == version
+    with pytest.raises(AppError) as changed:
+        agent_runtime._scope_tool(ctx, state, "start_agent_task", {"request": {
+            "project_id": source.id, "action": "revise_report", "base_version_id": str(uuid4())}})
+    assert changed.value.code == "REPORT_TARGET_CHANGED"

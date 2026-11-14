@@ -41,6 +41,7 @@ TOOLS = {
     "start_agent_task": Tool(inputs.ProjectTask, "执行无后端生成模型的统计、报告、修改、恢复、图表或导出任务"),
     "get_agent_chart": Tool(inputs.ChartRead, "读取明确图表版本的统计、原文范围和解读", True),
     "adopt_agent_research": Tool(inputs.ResearchAdopt, "以预期采用报告版本切换当前采用研究"),
+    "save_research_strategy": Tool(inputs.StrategySave, "校验原文证据并保存候选方向、风险、验证条件和阶段路线，创建新分析版本；模拟方案需明确标注"),
 }
 
 
@@ -223,6 +224,15 @@ def _execute(session, name, request):
         return {"research_id": draft.id, "conversation_id": draft.main_conversation_id,
                 "context": research_service.context_for(session, draft)}
     _expected(context, request.expected_revision)
+    if name == "save_research_strategy":
+        _ready(session, context)
+        if str(request.analysis_id) != context.get("analysis_id"):
+            raise AppError(409, "ANALYSIS_VERSION_CONFLICT", "请在当前研究的分析版本上完善方案")
+        run = create_run(session, "agent_strategy", project, {**request.model_dump(mode="json"),
+            "external_agent": True, "expected_analysis_id": context["analysis_id"]},
+            conversation_id=research.main_conversation_id if research else None)
+        run.scope_version_id, run.dataset_version_ids = context["scope_version_id"], list(context["dataset_version_ids"])
+        return {"run_id": run.id, "status": run.status}
     if name == "bind_agent_dataset":
         version = owned(session, DatasetVersion, request.dataset_version_id)
         if version.status != "ready":

@@ -115,6 +115,11 @@ def test_roadmap_uses_frozen_analysis_and_stable_action_ids(db_session, project,
     }]}}}
     db_session.flush()
     base = generated(db_session, project, context_factory, report_analysis)
+    assert any(block.get("section") == "roadmap" for block in base.content["blocks"])
+    # Older statistical report versions did not automatically include a ready
+    # roadmap. Their append operation must still use the frozen source below.
+    base.content = {**base.content, "blocks": [block for block in base.content["blocks"]
+        if block.get("section") != "roadmap" and block.get("direction_id") != "direction-fixed"]}
     report_analysis.views = {"roadmap": {"status": "ready", "data": {"items": []}}}
     db_session.flush()
     current = revise(db_session, project, context_factory, base, [{"op": "append_roadmap"}])

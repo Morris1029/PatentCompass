@@ -81,6 +81,7 @@ def build_report_content(snapshot, *, default_layout=None):
                     layout={"width_percent": 100, "alignment": "center"})
     technology = snapshot.get("views", {}).get("technology", {})
     semantic_ready = technology.get("status") == "ready" and technology.get("data", {}).get("classification") == "semantic"
+    strategy_ready = bool((snapshot.get("views", {}).get("opportunities", {}).get("data") or {}).get("items"))
     if semantic_ready:
         data = technology["data"]
         coverage = data.get("coverage", {})
@@ -106,51 +107,56 @@ def build_report_content(snapshot, *, default_layout=None):
             add("matrix-table", "table", columns=["申请人", "技术方法", "申请数"], rows=[
                 [item["applicant"], themes.get(item["theme_id"], item["theme_id"]), str(item["count"])]
                 for item in landscape["subject_matrix"]], caption="逐条申请归属计算；共同申请人全计数")
-        opportunities = snapshot.get("views", {}).get("opportunities", {}).get("data", {}).get("items", [])
-        if opportunities:
-            originals = {item["application_id"]: item for item in snapshot.get("evidence", []) if item.get("application_id")}
-            add("directions-heading", "heading", text="候选研究方向与风险关注", level=1)
-            for item in opportunities:
-                add(f"direction-{item['id']}", "heading", text=f"{item.get('priority', '')} {item['title']}", level=2,
-                    direction_id=item["id"])
-                add(f"direction-description-{item['id']}", "paragraph", text=item.get("description", ""), direction_id=item["id"])
-                add(f"direction-support-{item['id']}", "paragraph", text=(
-                    f"样本支持记录 {item.get('support_count', 0)} 条。{item.get('priority_reason', '')}"
-                    "外部补检尚未执行，不能据此认定技术空白、可专利性或法律结论。"), direction_id=item["id"],
-                    application_ids=item.get("supporting_application_ids", []))
-                for index, application_id in enumerate(item.get("supporting_application_ids", [])[:3]):
-                    evidence = originals.get(application_id)
-                    if evidence:
-                        original = evidence["content"]
-                        quotes = original.get("semantic_evidence", [])
-                        quote = next((part.get("quote") for part in quotes if part.get("theme_id") in
-                                      {item.get("method_theme_id"), item.get("scenario_theme_id")}), original.get("abstract", "")[:280])
-                        add(f"direction-evidence-{item['id']}-{index}", "paragraph", text=(
-                            f"原文依据：{original.get('application_number', application_id)}；"
-                            f"工作表 {original.get('source_sheet', '')}，第 {original.get('source_row', '')} 行。{quote}"),
-                            direction_id=item["id"], application_id=application_id, evidence_id=evidence["id"])
-                for index, comparison in enumerate(item.get("counterexample_search", {}).get("results", [])[:3]):
-                    evidence = originals.get(comparison["application_id"])
-                    number = evidence["content"].get("application_number") if evidence else comparison["application_id"]
-                    add(f"direction-comparison-{item['id']}-{index}", "paragraph", text=(
-                        f"本地相近记录（待人工核对）：{number}。{comparison.get('quote', '')}"),
-                        direction_id=item["id"], application_id=comparison["application_id"],
-                        evidence_id=evidence["id"] if evidence else None)
-                for risk in item.get("risks", []):
-                    add(f"risk-{risk['id']}", "paragraph", text=f"风险关注：{risk['title']}。{risk.get('reason', '')}",
-                        risk_id=risk["id"], direction_id=item["id"])
-        blocks.extend(_roadmap_blocks({"source": snapshot}, snapshot["analysis_id"], allow_unavailable=True))
-        geography = snapshot.get("views", {}).get("geography", {}).get("data", {})
-        if geography.get("country"):
-            add("source-country-heading", "heading", text="申请人来源国家", level=1)
-            add("source-country-table", "table", columns=["来源国家", "申请数"],
-                rows=[[item["country"], str(item["count"])] for item in geography["country"]],
-                caption="共同来源国家全计数；不等于保护地")
-            add("source-country-limit", "paragraph", text="省市、有效保护地与同族视角缺少必要字段，当前不能生成对应结论。")
+    opportunities = (snapshot.get("views", {}).get("opportunities", {}).get("data") or {}).get("items", [])
+    if opportunities:
+        originals = {item["application_id"]: item for item in snapshot.get("evidence", []) if item.get("application_id")}
+        add("directions-heading", "heading", text="候选研究方向与风险关注", level=1)
+        for item in opportunities:
+            if item.get("basis") == "mock":
+                add(f"direction-mock-{item['id']}", "paragraph", text="模拟方案（不计入真实专利证据）", direction_id=item["id"])
+            add(f"direction-{item['id']}", "heading", text=f"{item.get('priority', '')} {item['title']}", level=2,
+                direction_id=item["id"])
+            add(f"direction-description-{item['id']}", "paragraph", text=item.get("description", ""), direction_id=item["id"])
+            add(f"direction-support-{item['id']}", "paragraph", text=(
+                f"样本支持记录 {item.get('support_count', 0)} 条。{item.get('priority_reason', '')}"
+                "外部补检尚未执行，不能据此认定技术空白、可专利性或法律结论。"), direction_id=item["id"],
+                application_ids=item.get("supporting_application_ids", []))
+            for index, application_id in enumerate(item.get("supporting_application_ids", [])[:3]):
+                evidence = next((row for row in snapshot.get("evidence", []) if row.get("application_id") == application_id
+                    and row.get("content", {}).get("direction_id") == item["id"]), None) or originals.get(application_id)
+                if evidence:
+                    original = evidence["content"]
+                    quotes = original.get("semantic_evidence", [])
+                    quote = next((part.get("quote") for part in quotes if part.get("theme_id") in
+                                  {item.get("method_theme_id"), item.get("scenario_theme_id")}), original.get("abstract", "")[:280])
+                    quote = next((part["quote"] for part in item.get("evidence", []) if part["application_id"] == application_id), quote)
+                    add(f"direction-evidence-{item['id']}-{index}", "paragraph", text=(
+                        f"原文依据：{original.get('application_number', application_id)}；"
+                        f"工作表 {original.get('source_sheet', '')}，第 {original.get('source_row', '')} 行。{quote}"),
+                        direction_id=item["id"], application_id=application_id, evidence_id=evidence["id"])
+            for index, comparison in enumerate(item.get("counterexample_search", {}).get("results", [])[:3]):
+                evidence = originals.get(comparison["application_id"])
+                number = evidence["content"].get("application_number") if evidence else comparison["application_id"]
+                add(f"direction-comparison-{item['id']}-{index}", "paragraph", text=(
+                    f"本地相近记录（待人工核对）：{number}。{comparison.get('quote', '')}"),
+                    direction_id=item["id"], application_id=comparison["application_id"],
+                    evidence_id=evidence["id"] if evidence else None)
+            for risk in item.get("risks", []):
+                add(f"risk-{risk['id']}", "paragraph", text=f"风险关注：{risk['title']}。{risk.get('reason', '')}",
+                    risk_id=risk["id"], direction_id=item["id"])
+    blocks.extend(_roadmap_blocks({"source": snapshot}, snapshot["analysis_id"], allow_unavailable=True))
+    geography = snapshot.get("views", {}).get("geography", {}).get("data") or {}
+    if geography.get("country"):
+        add("source-country-heading", "heading", text="申请人来源国家", level=1)
+        add("source-country-table", "table", columns=["来源国家", "申请数"],
+            rows=[[item["country"], str(item["count"])] for item in geography["country"]],
+            caption="共同来源国家全计数；不等于保护地")
+        add("source-country-limit", "paragraph", text="省市、有效保护地与同族视角缺少必要字段，当前不能生成对应结论。")
     add("limits-heading", "heading", text="可用结论与待补充资料", level=1)
     add("limits", "paragraph", text=(
         "本次提供年度、申请人和 IPC 描述性统计，以及原文摘要定位。"
         + ("语义分类覆盖全部入选记录；候选方向与阶段行动仅用于后续核查，不表示已证明的技术空白。" if semantic_ready else
+           "候选方向与阶段行动基于核验原文提出，属于待验证研究建议，不代表全量语义分类或已证明的技术空白。" if strategy_ready else
            "IPC 分类不能直接替代语义技术路线。当前固定分析未形成语义分类和候选路线结论。")
         + "省市、有效保护地和同族视角缺少必要字段；仍需权利要求、法律状态及外部补检证据。"))
     add("representatives-heading", "heading", text="样本记录与原文证据附录", level=1)
@@ -166,7 +172,8 @@ def build_report_content(snapshot, *, default_layout=None):
             f"来源工作表：{record['source_sheet']}；原始行：{record['source_row']}；"
             f"数据版本：{record['dataset_version_id']}。"), application_id=key)
         add(f"abstract-{key}", "paragraph", text=record["abstract"], application_id=key)
-    return {"title": f"{snapshot['project_name']} 专利样本统计简报", "blocks": blocks,
+    title = "专利导航研究报告" if semantic_ready or strategy_ready else "专利样本统计简报"
+    return {"title": f"{snapshot['project_name']} {title}", "blocks": blocks,
             "layout": deepcopy(DEFAULT_REPORT_LAYOUT if default_layout is None else default_layout),
             "source": {key: deepcopy(value) for key, value in snapshot.items()
                        if key not in {"charts", "evidence", "representatives", "project_name"}},
@@ -194,7 +201,7 @@ def replace_block(content, block_id, replacement):
 
 def _roadmap_blocks(content, namespace, allow_unavailable=False):
     view = content.get("source", {}).get("views", {}).get("roadmap", {})
-    items = view.get("data", {}).get("items", [])
+    items = (view.get("data") or {}).get("items", [])
     if view.get("status") != "ready" or not items:
         if allow_unavailable:
             return []
@@ -210,10 +217,16 @@ def _roadmap_blocks(content, namespace, allow_unavailable=False):
         direction_id = item["id"]
         add(direction_id, "heading", text=f"{item.get('priority', '')} {item['title']}", level=2,
             direction_id=direction_id)
+        if item.get("provenance"):
+            add(direction_id + "-basis", "paragraph", text=item["provenance"]["label"], direction_id=direction_id)
         add(direction_id + "-conditions", "paragraph", text="推进条件：" + "；".join(item.get("conditions", [])),
             direction_id=direction_id)
         for phase in item.get("phases", []):
             add(phase["id"], "heading", text=phase["title"], level=3, direction_id=direction_id, phase_id=phase["id"])
+            if phase.get("deliverable"):
+                add(phase["id"] + "-deliverable", "paragraph", text="阶段交付物：" + phase["deliverable"], direction_id=direction_id)
+            if phase.get("acceptance"):
+                add(phase["id"] + "-acceptance", "paragraph", text="验收条件：" + phase["acceptance"], direction_id=direction_id)
             for index, action in enumerate(phase.get("actions", [])):
                 add(f"{phase['id']}-action-{index}", "paragraph", text=(
                     f"行动：{action['title']}；负责人：{action.get('owner', '待分配')}；"
