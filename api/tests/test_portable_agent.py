@@ -285,14 +285,59 @@ def test_taxonomy_rejects_unmapped_or_duplicate_short_ids(db_session, source):
     task = start(db_session, source)
     batch = call(db_session, "get_semantic_batch", {"run_id": task["run_id"]})
     call(db_session, "submit_semantic_batch", {"run_id": task["run_id"], "records": extraction(batch)})
-    for members in ([], ["e0", "e0"], ["unknown"]):
+    for members, missing, duplicates, unknown in (([], ["e0"], [], []), (["e0", "e0"], [], ["e0"], []),
+                                                  (["unknown"], ["e0"], [], ["unknown"])):
         with pytest.raises(AppError) as error:
             call(db_session, "submit_semantic_taxonomy", {"run_id": task["run_id"], "dimension": "elements",
                 "themes": [{"label": "Theme", "members": members}] if members else []})
         assert error.value.code == "TAXONOMY_COVERAGE_MISMATCH"
+        assert error.value.details == {"missing_ids": missing, "duplicate_ids": duplicates, "unknown_ids": unknown}
     with pytest.raises(AppError) as error:
         call(db_session, "finish_semantic_analysis", {"run_id": task["run_id"]})
     assert error.value.code == "TAXONOMY_INCOMPLETE"
+
+
+def test_regrouping_reuses_frozen_extractions_and_review_reasons_without_generation(db_session, source):
+    from app.models import ResearchRun, RunStep
+    task = start(db_session, source)
+    batch = call(db_session, "get_semantic_batch", {"run_id": task["run_id"]})
+    records = extraction(batch)
+    records[0]["methods"].append({"label": "invalid extra", "quote": "not in original", "field": "abstract", "confidence": .9})
+    call(db_session, "submit_semantic_batch", {"run_id": task["run_id"], "records": records})
+
+    def finish(identifier):
+        for dimension in ("elements", "methods", "scenarios"):
+            labels = call(db_session, "get_semantic_taxonomy", {"run_id": identifier, "dimension": dimension})["labels"]
+            call(db_session, "submit_semantic_taxonomy", {"run_id": identifier, "dimension": dimension,
+                "themes": [{"label": dimension, "members": [item["id"] for item in labels]}]})
+        return complete(db_session, call(db_session, "finish_semantic_analysis", {"run_id": identifier}))
+
+    original = finish(task["run_id"])
+    request = {"project_id": source.id, "expected_revision": context(db_session, source)["revision"],
+        "agent_model": "review-host", "skill_version": "1", "reuse_run_id": task["run_id"]}
+    revised = call(db_session, "start_semantic_analysis", request)
+    assert revised["processed_count"] == 2 and revised["next_batch_index"] is None
+    old = db_session.scalar(select(RunStep).where(RunStep.run_id == task["run_id"], RunStep.key == "agent_batch_0"))
+    new = db_session.scalar(select(RunStep).where(RunStep.run_id == revised["run_id"], RunStep.key == "agent_batch_0"))
+    assert old.result == new.result and any(row["review_reasons"] for row in new.result.values())
+    saved = finish(revised["run_id"])
+    coverage = db_session.get(AnalysisResult, saved["analysis_id"]).summary["semantic"]
+    assert coverage["review_count"] == 1 and coverage["cached_count"] == 2
+    assert coverage["agent"]["extraction_source_run_id"] == task["run_id"]
+    assert db_session.get(AnalysisResult, original["analysis_id"]).summary["semantic"]["review_count"] == 1
+    request["expected_revision"] = context(db_session, source)["revision"]
+    db_session.get(ResearchRun, task["run_id"]).owner_id = "other-owner"
+    db_session.flush()
+    with pytest.raises(AppError) as error:
+        call(db_session, "start_semantic_analysis", request)
+    assert error.value.status_code == 404
+    db_session.get(ResearchRun, task["run_id"]).owner_id = get_settings().dev_owner_id
+    patent = db_session.scalar(select(PatentApplication).where(PatentApplication.dataset_version_id == source.dataset_version_id))
+    patent.abstract += " changed"
+    db_session.flush()
+    with pytest.raises(AppError) as error:
+        call(db_session, "start_semantic_analysis", request)
+    assert error.value.code == "SEMANTIC_REUSE_MISMATCH"
 
 
 def test_ownership_and_stale_context_checks_precede_task_creation(db_session, source):

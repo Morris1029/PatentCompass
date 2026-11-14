@@ -1,5 +1,7 @@
 """Portable-agent operations over the existing project and durable task services."""
 
+from collections import Counter
+from copy import deepcopy
 from dataclasses import dataclass
 import math
 
@@ -252,16 +254,29 @@ def _execute(session, name, request):
             "dataset_version_ids": context["dataset_version_ids"]})["items"]
         if not rows:
             raise AppError(422, "NO_SELECTED_PATENTS", "当前范围没有申请记录")
+        sources = [{"id": row.id, "sha256": text_hash(row)} for row in rows]
+        previous = _run(session, request.reuse_run_id) if request.reuse_run_id else None
+        if previous:
+            if (previous.status != "succeeded" or previous.project_id != project.id
+                    or previous.scope_version_id != context["scope_version_id"]
+                    or previous.dataset_version_ids != context["dataset_version_ids"]
+                    or previous.payload["sources"] != sources):
+                raise AppError(409, "SEMANTIC_REUSE_MISMATCH", "只能复用本项目相同范围与冻结原文的已完成任务")
+            _extractions(session, previous)
         run = create_run(session, "agent_analysis", project, {"research_id": research.id if research else None,
             "external_agent": True, "agent_model": request.agent_model, "skill_version": request.skill_version,
             "expected_revision": context["revision"], "expected_analysis_id": context["analysis_id"],
-            "sources": [{"id": row.id, "sha256": text_hash(row)} for row in rows]},
+            "sources": sources, **({"extraction_source_run_id": previous.id,
+                "extraction_agent_model": previous.payload["agent_model"]} if previous else {})},
             conversation_id=research.main_conversation_id if research else None)
         run.status, run.dispatch_pending = "waiting_input", False
         run.scope_version_id, run.dataset_version_ids = context["scope_version_id"], list(context["dataset_version_ids"])
+        if previous:
+            for key, value in _steps(session, previous, "agent_batch_").items():
+                _save_step(session, run, key, deepcopy(value))
         run.input_request = {"id": run.id, "kind": "agent_semantics", "prompt": "由外部 Agent 分批提交语义标签和主题"}
         emit_event(session, run.id, "input.required", run.input_request)
-        return {"run_id": run.id, "status": run.status, "total_count": len(rows),
+        return {**_batch_progress(session, run, rows, 0),
                 "batch_size": semantics.BATCH_SIZE, "batch_count": math.ceil(len(rows) / semantics.BATCH_SIZE)}
     return _project_task(session, project, research, context, request)
 
@@ -305,7 +320,11 @@ def _semantic_step(session, name, request):
             return {"run_id": run.id, "dimension": dimension, "labels": [{"id": k, "label": v} for k, v in ids.items()]}
         members = [member for theme in request.themes for member in theme.members]
         if len(members) != len(ids) or set(members) != set(ids):
-            raise AppError(422, "TAXONOMY_COVERAGE_MISMATCH", "主题必须恰好覆盖本维度全部短ID")
+            counts = Counter(members)
+            raise AppError(422, "TAXONOMY_COVERAGE_MISMATCH", "主题必须恰好覆盖本维度全部短ID，请按 details 修正后重新提交完整主题", {
+                "missing_ids": sorted(set(ids) - set(members)),
+                "duplicate_ids": sorted(key for key, count in counts.items() if count > 1),
+                "unknown_ids": sorted(set(members) - set(ids))})
         value = semantics.validate_taxonomy_dimension(dimension, labels,
             {dimension: [theme.model_dump() for theme in request.themes]})
         _save_step(session, run, "agent_taxonomy_" + dimension, value)
@@ -330,7 +349,8 @@ def execute_analysis(ctx):
             session.expunge(row)
     taxonomy = ctx.payload["taxonomy"]
     assignments = semantics.assign_themes(ctx.payload["extractions"], taxonomy)
-    return ctx.step("persist_agent_analysis", lambda: _persist(ctx, rows, assignments, taxonomy, 0))
+    return ctx.step("persist_agent_analysis", lambda: _persist(ctx, rows, assignments, taxonomy,
+        len(rows) if ctx.payload.get("extraction_source_run_id") else 0))
 
 
 def _project_task(session, project, research, context, request):

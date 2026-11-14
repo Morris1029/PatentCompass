@@ -44,6 +44,7 @@ class SemanticStart(ProjectRef):
     expected_revision: int = Field(ge=0)
     agent_model: str = Field(min_length=1, max_length=200)
     skill_version: str = Field(min_length=1, max_length=100)
+    reuse_run_id: UUID | None = None
 
 
 class RunRef(Input):

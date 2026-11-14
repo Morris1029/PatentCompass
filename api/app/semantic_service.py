@@ -143,6 +143,9 @@ def _persist(ctx, patents, assignments, taxonomy, cached_count, revision_of_id=N
         coverage = draft["summary"]["semantic"]
         if ctx.payload.get("external_agent"):
             coverage["agent"] = {"model": ctx.payload["agent_model"], "skill_version": ctx.payload["skill_version"]}
+            if ctx.payload.get("extraction_source_run_id"):
+                coverage["agent"].update(extraction_source_run_id=ctx.payload["extraction_source_run_id"],
+                    extraction_model=ctx.payload["extraction_agent_model"])
         analysis = AnalysisResult(id=new_id(), project_id=ctx.project_id, run_id=ctx.run_id, scope_version_id=ctx.scope_version_id,
                                   dataset_version_ids=ctx.dataset_version_ids, patent_ids=draft["patent_ids"],
                                   summary=draft["summary"], revision_of_id=revision_of_id)

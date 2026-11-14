@@ -270,7 +270,7 @@ def _invoke(ctx, state, name, arguments, call_id):
             state["children"].append(child_id)
     if name == "start_semantic_analysis":
         ctx.emit("activity.updated", {"id": child_id, "kind": "analyze", "status": "running",
-            "phase": "识别专利技术", "processed_count": 0, "total_count": value["total_count"]})
+            "phase": "识别专利技术", "processed_count": value.get("processed_count", 0), "total_count": value["total_count"]})
     if name in {"get_semantic_batch", "submit_semantic_batch"} and "processed_count" in value:
         progress = {"stage": "extract", "processed_count": value["processed_count"], "total_count": value["total_count"]}
         ctx.emit("analysis.progress", progress)
