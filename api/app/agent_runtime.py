@@ -24,7 +24,7 @@ _HIDDEN = {"classify_patents", "build_embeddings", "build_report", "revise_repor
            "create_agent_project", "create_agent_research", "update_agent_scope", "bind_agent_dataset",
            "adopt_agent_research", "list_projects", "parse_patent_workbook", "parse_document", "render_chart", "export_docx"}
 _ARTIFACTS = {"analysis_id", "report_id", "report_version_id", "research_id", "chart_id", "chart_version_id", "file_id", "download_url"}
-_PROGRESS = _ARTIFACTS | {"run_id", "status", "batch_index", "batch_count", "total_count", "completed_batches", "dimension", "theme_count", "review"}
+_PROGRESS = _ARTIFACTS | {"run_id", "status", "batch_index", "batch_count", "batch_status", "next_batch_index", "processed_count", "total_count", "completed_batches", "semantic_progress", "dimension", "theme_count", "review"}
 
 
 def _save(ctx, state):
@@ -244,6 +244,8 @@ def _invoke(ctx, state, name, arguments, call_id):
         if not state["skills"]:
             raise AppError(422, "SKILL_REQUIRED", "请先加载本轮专业技能")
         return _prepare(ctx, arguments)
+    if name == "get_run":
+        arguments = {"view": "progress", **arguments}
     _, arguments = tool_service.validate_arguments(name, arguments)
     _scope_tool(ctx, state, name, arguments)
     if name == "read_agent_reference" and arguments.get("name") not in state["skills"]:
@@ -266,6 +268,14 @@ def _invoke(ctx, state, name, arguments, call_id):
     if child_id and name in {"start_semantic_analysis", "start_agent_task", "save_research_strategy", "retry_run"}:
         if child_id not in state["children"]:
             state["children"].append(child_id)
+    if name == "start_semantic_analysis":
+        ctx.emit("activity.updated", {"id": child_id, "kind": "analyze", "status": "running",
+            "phase": "识别专利技术", "processed_count": 0, "total_count": value["total_count"]})
+    if name in {"get_semantic_batch", "submit_semantic_batch"} and "processed_count" in value:
+        progress = {"stage": "extract", "processed_count": value["processed_count"], "total_count": value["total_count"]}
+        ctx.emit("analysis.progress", progress)
+        ctx.emit("activity.updated", {"id": arguments["request"]["run_id"], "kind": "analyze", "status": "running",
+            "phase": "识别专利技术", **{key: progress[key] for key in ("processed_count", "total_count")}})
     if name == "load_agent_skill":
         state["skills"][value["name"]] = {"content": value["content"], "references": {}}
         ctx.emit("agent.skill.loaded", {"name": value["name"], "sha256": hashlib.sha256(value["content"].encode()).hexdigest()})

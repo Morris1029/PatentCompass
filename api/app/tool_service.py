@@ -1,6 +1,7 @@
 """One typed tool contract and dispatcher for MCP and the built-in agent."""
 
 from dataclasses import dataclass
+from typing import Literal
 
 from pydantic import ConfigDict, Field, ValidationError, create_model
 
@@ -21,6 +22,10 @@ class ReferenceInput(SkillInput):
 
 class WriteRunInput(RunInput):
     idempotency_key: str = Field(min_length=1, max_length=200)
+
+
+class RunStatusInput(RunInput):
+    view: Literal["full", "progress"] = "full"
 
 
 @dataclass(frozen=True)
@@ -59,7 +64,7 @@ def catalogue():
             arguments = create_model(name + "Arguments", __config__=ConfigDict(extra="forbid"), **fields)
             result[name] = Tool(arguments, spec.description, read_only, group)
     for name, model, description, read_only in (
-        ("get_run", RunInput, "读取任务状态、结果、错误和待确认问题", True),
+        ("get_run", RunStatusInput, "读取任务状态、结果、错误和待确认问题；轮询时使用 progress 视图，省略检查点原文并保留批次进度", True),
         ("get_run_events", EventsInput, "按序号读取任务事件", True),
         ("cancel_run", WriteRunInput, "请求取消任务，接受请求不等于执行已停止", False),
         ("retry_run", WriteRunInput, "创建关联重试任务，复用兼容检查点", False),
@@ -90,7 +95,7 @@ def invoke(session, name, arguments):
     if spec.group == "agent":
         return agent_service.invoke(session, name, value["request"], value.get("idempotency_key"))
     if name == "get_run":
-        return task_service.get_run(session, value["run_id"])
+        return task_service.get_run(session, value["run_id"], view=value["view"])
     if name == "get_run_events":
         return task_service.get_run_events(session, value["run_id"], value["after"], value["limit"])
     if name in {"cancel_run", "retry_run"}:

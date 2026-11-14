@@ -63,6 +63,24 @@ def context(session, project, research=None):
         **({"research_id": research} if research else {})})["context"]
 
 
+def test_semantic_receipts_identify_saved_batches_and_next_missing_index(db_session, source):
+    task = start(db_session, source)
+    request = {"run_id": task["run_id"], "batch_index": 0}
+    batch = call(db_session, "get_semantic_batch", request)
+    assert batch["batch_status"] == "pending" and batch["next_batch_index"] == 0
+    receipt = call(db_session, "submit_semantic_batch", {**request, "records": extraction(batch)})
+    assert receipt["batch_status"] == "completed" and receipt["completed_batches"] == [0]
+    assert receipt["next_batch_index"] is None and receipt["processed_count"] == receipt["total_count"] == 2
+    restored = call(db_session, "get_semantic_batch", request)
+    assert restored["batch_status"] == "completed" and restored["next_batch_index"] is None
+    from app import tool_service
+    brief = tool_service.invoke(db_session, "get_run", {"run_id": task["run_id"], "view": "progress"})
+    full = tool_service.invoke(db_session, "get_run", {"run_id": task["run_id"]})
+    assert brief["semantic_progress"]["processed_count"] == 2
+    assert all("result" not in item for item in brief["steps"])
+    assert any("result" in item for item in full["steps"])
+
+
 def start(session, project, research=None):
     ctx = context(session, project, research)
     return call(session, "start_semantic_analysis", {"project_id": project.id,

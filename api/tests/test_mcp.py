@@ -58,7 +58,7 @@ def controlled_mcp(monkeypatch):
     monkeypatch.setattr(app, "capability_service", service, raising=False)
     monkeypatch.setattr(tool_service, "capability_service", service)
     monkeypatch.setattr(mcp_server, "session_scope", session_scope)
-    monkeypatch.setattr(tool_service.task_service, "get_run", lambda session, identifier: {"run_id": identifier, "status": "running"})
+    monkeypatch.setattr(tool_service.task_service, "get_run", lambda session, identifier, view="full": {"run_id": identifier, "status": "running"})
     monkeypatch.setattr(tool_service.task_service, "get_run_events", lambda session, identifier, after, limit: {
         "run_id": identifier, "after": after, "limit": limit, "items": []})
     monkeypatch.setattr(tool_service.task_service, "cancel_run", lambda session, identifier: {"run_id": identifier, "status": "cancelling"})
@@ -167,7 +167,7 @@ def test_streamable_http_mount_lifespan_and_reconnect_keep_business_task_referen
         return result, status
 
     monkeypatch.setattr(app.capability_service, "invoke", submit)
-    monkeypatch.setattr(tool_service.task_service, "get_run", lambda session, run_id: saved[run_id])
+    monkeypatch.setattr(tool_service.task_service, "get_run", lambda session, run_id, view="full": saved[run_id])
 
     @asynccontextmanager
     async def lifespan(app):

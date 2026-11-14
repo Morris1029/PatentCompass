@@ -3,11 +3,11 @@ from copy import deepcopy
 import pytest
 from sqlalchemy import select
 
-from app import agent_contracts, data_service, strategy_service
+from app import agent_contracts, chart_service, data_service, strategy_service
 from app.errors import AppError
 from app.models import AnalysisResult, Chart, Evidence, PatentApplication
 from patentcompass_core.reports import build_report_content
-from test_portable_agent import source
+from test_portable_agent import source, call, complete, context, start, submit_all
 from test_agent_runtime import client, _plan, _run_message
 
 
@@ -82,3 +82,19 @@ def test_strategy_rejects_wrong_quotes_and_foreign_ids_and_marks_authorized_mock
     saved = strategy_service.build_directions(db_session, analysis, [parsed], "model", allow_mock=True)[0]
     assert saved["support_count"] == 0 and saved["supporting_application_ids"] == []
     assert "模拟" in saved["provenance"]["label"]
+
+
+def test_strategy_preserves_semantic_memberships_for_chart_data_edits(db_session, source):
+    task = start(db_session, source)
+    analysis = complete(db_session, submit_all(db_session, task))
+    base = db_session.get(AnalysisResult, analysis["analysis_id"])
+    patent = db_session.get(PatentApplication, base.patent_ids[0])
+    task = call(db_session, "save_research_strategy", {"project_id": source.id,
+        "expected_revision": context(db_session, source)["revision"], "analysis_id": base.id,
+        "agent_model": "controlled-host", "directions": [proposal(patent)]})
+    saved = complete(db_session, task)
+    chart = db_session.scalar(select(Chart).where(Chart.analysis_id == saved["analysis_id"], Chart.kind == "methods"))
+    snapshot = chart_service.snapshot(db_session, chart)
+    recomputed = chart_service._recount(db_session, chart, snapshot, {})
+    assert recomputed["data"]["rows"] == snapshot["data"]["rows"]
+    assert recomputed["data"]["rows"][0]["count"] == 2

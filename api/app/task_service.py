@@ -22,7 +22,7 @@ def research_record(session, research):
                         "current_analysis_id": context.get("analysis_id"), "revision": research.revision}}
 
 
-def get_run(session, run_id):
+def get_run(session, run_id, view="full"):
     from app.conversation_execution import activities_for_run, scope_editable_for_run
     from app.chat_streaming import stream_for_run
     run = owned(session, ResearchRun, run_id)
@@ -36,7 +36,15 @@ def get_run(session, run_id):
         request["scope"] = {**(scope.content if scope else {}), **request.get("scope", {}), **request.get("changes", {})}
         request["scope_editable"] = scope_editable_for_run(run) if request["kind"] == "execution_confirmation" else True
     research_id = run.payload.get("research_id")
-    return public_value({**record(run, exclude=("lease_token", "payload")), "steps": [record(item) for item in steps],
+    progress = {}
+    if view == "progress" and run.kind == "agent_analysis":
+        from app.agent_service import _batch_progress
+        receipt = _batch_progress(session, run, run.payload["sources"], 0)
+        progress["semantic_progress"] = {key: value for key, value in receipt.items() if key not in {"batch_index", "batch_status", "status", "run_id"}}
+        progress["semantic_progress"]["completed_dimensions"] = [item.key.removeprefix("agent_taxonomy_") for item in steps
+            if item.key.startswith("agent_taxonomy_") and item.status == "succeeded"]
+    return public_value({**record(run, exclude=("lease_token", "payload")), **progress,
+        "steps": [record(item, exclude=("result",) if view == "progress" else ()) for item in steps],
         "research_id": research_id,
         "context": research_record(session, session.get(ResearchVersion, research_id))["context"] if research_id else None,
         "input_request": request, "plan": run.payload.get("plan"),

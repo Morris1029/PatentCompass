@@ -266,6 +266,16 @@ def _execute(session, name, request):
     return _project_task(session, project, research, context, request)
 
 
+def _batch_progress(session, run, rows, index):
+    count = math.ceil(len(rows) / semantics.BATCH_SIZE)
+    completed = sorted(int(key.rsplit("_", 1)[1]) for key in _steps(session, run, "agent_batch_"))
+    return {"run_id": run.id, "status": run.status, "batch_index": index, "batch_count": count,
+        "total_count": len(rows), "completed_batches": completed,
+        "batch_status": "completed" if index in completed else "pending",
+        "next_batch_index": next((value for value in range(count) if value not in completed), None),
+        "processed_count": sum(min(semantics.BATCH_SIZE, len(rows) - value * semantics.BATCH_SIZE) for value in completed)}
+
+
 def _semantic_step(session, name, request):
     run = _run(session, request.run_id, writing=not TOOLS[name].read_only)
     rows = _records(session, run)
@@ -276,9 +286,7 @@ def _semantic_step(session, name, request):
             raise AppError(422, "BATCH_NOT_FOUND", "批次不存在")
         mapping = {f"p{index}": row for index, row in enumerate(batch)}
         if name == "get_semantic_batch":
-            return {"run_id": run.id, "status": run.status, "batch_index": request.batch_index,
-                "batch_count": math.ceil(len(rows) / semantics.BATCH_SIZE), "total_count": len(rows),
-                "completed_batches": sorted(int(key.rsplit("_", 1)[1]) for key in _steps(session, run, "agent_batch_")),
+            return {**_batch_progress(session, run, rows, request.batch_index),
                 "records": [{"id": key, "application_number": row.application_number,
                     "title": row.title, "abstract": row.abstract} for key, row in mapping.items()]}
         submitted = [item.model_dump() for item in request.records]
@@ -286,7 +294,7 @@ def _semantic_step(session, name, request):
             raise AppError(422, "SEMANTIC_COVERAGE_MISMATCH", "必须恰好提交本批全部短ID，不可重复、遗漏或新增")
         result = {mapping[item["id"]].id: semantics.validate_extraction(mapping[item["id"]], item) for item in submitted}
         _save_step(session, run, f"agent_batch_{request.batch_index}", result)
-        return {"run_id": run.id, "batch_index": request.batch_index,
+        return {**_batch_progress(session, run, rows, request.batch_index),
                 "review": {key: value["review_reasons"] for key, value in result.items() if value["review_reasons"]}}
     extractions = _extractions(session, run)
     labels = semantics.taxonomy_labels(extractions)

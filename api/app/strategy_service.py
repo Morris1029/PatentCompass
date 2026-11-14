@@ -9,7 +9,7 @@ from sqlalchemy import select
 from app import agent_contracts
 from app.db import session_scope
 from app.errors import AppError
-from app.models import AnalysisResult, Chart, Evidence, PatentApplication, new_id
+from app.models import AnalysisResult, Chart, Evidence, PatentApplication, SemanticMembership, new_id
 from app.resource_service import owned
 
 
@@ -74,6 +74,9 @@ def persist_strategy(ctx):
                 patent_ids=list(base.patent_ids), summary=deepcopy(base.summary), views={}, revision_of_id=base.id)
             session.add(revised)
             session.flush()
+            for row in session.scalars(select(SemanticMembership).where(SemanticMembership.analysis_id == base.id)):
+                session.add(SemanticMembership(analysis_id=revised.id, application_id=row.application_id,
+                    taxonomy_version=row.taxonomy_version, status=row.status, assignment=deepcopy(row.assignment)))
             chart_ids, evidence_ids = {}, {}
             for row in session.scalars(select(Chart).where(Chart.analysis_id == base.id)):
                 copy = Chart(id=new_id(), project_id=ctx.project_id, analysis_id=revised.id, kind=row.kind,

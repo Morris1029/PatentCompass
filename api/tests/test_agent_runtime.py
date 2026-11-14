@@ -458,3 +458,13 @@ def test_missing_report_base_has_actionable_feedback_without_relaxing_target(db_
         agent_runtime._scope_tool(ctx, state, "start_agent_task", {"request": {
             "project_id": source.id, "action": "revise_report", "base_version_id": str(uuid4())}})
     assert changed.value.code == "REPORT_TARGET_CHANGED"
+
+
+def test_semantic_checkpoints_publish_visible_parent_progress(client, db_session, source, monkeypatch):
+    sent, state, director, _ = _run_message(client, source, None, "完整语义分析", monkeypatch, _analysis(source))
+    progress = list(db_session.scalars(select(RunEvent).where(RunEvent.run_id == sent["run_id"], RunEvent.event_type == "analysis.progress")))
+    assert progress[-1].payload["processed_count"] == progress[-1].payload["total_count"] == 2
+    assert any(item["kind"] == "analyze" and item.get("processed_count") == 2 for item in state["activities"])
+    result = next(json.loads(item["content"]) for item in reversed(director.calls[-1]) if item["role"] == "tool")
+    assert result["semantic_progress"]["processed_count"] == 2
+    assert all("result" not in step for step in result["steps"])

@@ -27,7 +27,7 @@ EVENT_FIELDS = {
     "input.required": {"kind", "title", "prompt"},
     "input.received": {"kind"},
     "plan.ready": {"action", "reason"},
-    "activity.updated": {"id", "kind", "status"} | ARTIFACT_KEYS,
+    "activity.updated": {"id", "kind", "status", "phase", "processed_count", "total_count"} | ARTIFACT_KEYS,
     "artifact.ready": ARTIFACT_KEYS,
     "run.completed": {"status"},
     "run.failed": {"status"},
