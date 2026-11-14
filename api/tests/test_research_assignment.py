@@ -4,6 +4,9 @@ import json
 
 from fastapi.testclient import TestClient
 import pytest
+
+# These model doubles exercise compatibility with conversations created before the runtime migration.
+pytestmark = pytest.mark.usefixtures("legacy_conversation_runs")
 from sqlalchemy import func, select
 
 from app import jobs, model_provider, report_service

@@ -1,5 +1,7 @@
 """One application entrypoint for standalone HTTP and MCP capabilities."""
 
+from patentcompass_agent import prompt_version, read_prompt
+
 from copy import deepcopy
 from dataclasses import dataclass
 import hashlib
@@ -133,6 +135,12 @@ def _model_fingerprint(name, request):
     value = {"protocol": "responses-v1" if prefix == "llm" else "embeddings-v1",
              "model": getattr(settings, prefix + "_model"), "base_url": getattr(settings, prefix + "_base_url"),
              "options": settings.llm_extra_body if prefix == "llm" else {"batch_size": settings.embedding_batch_size}}
+    if prefix == "llm":
+        names = {"classify_patents": ("semantic-extraction", "semantic-taxonomy"),
+                 "build_report": ("report-summary",), "revise_report_content": ("report-rewrite",)}[name]
+        versions = {key: prompt_version(key, "legacy") for key in names}
+        if any(version != "legacy" for version in versions.values()):
+            value["prompts"] = versions
     return hashlib.sha256(json.dumps(value, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
 
 
@@ -276,7 +284,7 @@ def _execute(session, name, request, ctx=None):
         if request.report_mode == "ai":
             def summarize():
                 response = model_provider.chat([
-                    {"role": "system", "content": "请用中文总结给定专利样本事实。只引用给定编号，不新增计数，不判断法律状态或未检索的空白。"},
+                    {"role": "system", "content": read_prompt('report-summary')},
                     {"role": "user", "content": json.dumps({"summary": snapshot["summary"], "records": representatives}, ensure_ascii=False)}])
                 return {"text": reports._response_text(response)}
             synthesis = ctx.step("capability_report_synthesis", summarize) if ctx else summarize()

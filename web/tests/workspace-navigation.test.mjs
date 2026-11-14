@@ -35,6 +35,8 @@ const imports = {
   "@/lib/research": pathToFileURL(require.resolve("../src/lib/research.ts")).href,
   "./shared": moduleUrl("export function Empty() {} export function ErrorNotice() {} export function Modal() {}"),
   "./chat": emptyComponent, "./workbench": emptyComponent, "./report": emptyComponent, "./workspace-icon": emptyComponent,
+  "./management": moduleUrl("export default function Management() {} export function UserMenu() {}"),
+  "@/lib/management": pathToFileURL(require.resolve("../src/lib/management.ts")).href,
 };
 const { outputText } = ts.transpileModule(readFileSync(new URL("../src/components/workspace.tsx", import.meta.url), "utf8"), {
   compilerOptions: { jsx: ts.JsxEmit.ReactJSX, module: ts.ModuleKind.ESNext },
@@ -75,4 +77,11 @@ test("the promoted report entry retains the original adopted-report navigation",
   const query = clickSection("project=project&view=workbench&research=older-research&version=revision&diff=previous", "导航报告");
   assert.equal(query.get("view"), "report");
   for (const key of ["research", "version", "diff"]) assert.equal(query.get(key), null);
+});
+
+test("opening a business section exits management and preserves the historical analysis target", () => {
+  const query = clickSection("project=project&view=workbench&tab=overview&analysis_id=historical-analysis&management=runs&management_run=task", "态势分析");
+  assert.equal(query.get("management"), null);
+  assert.equal(query.get("management_run"), null);
+  assert.equal(query.get("analysis_id"), "historical-analysis");
 });

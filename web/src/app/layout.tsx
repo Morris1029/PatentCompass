@@ -1,5 +1,6 @@
 import type { Metadata, Viewport } from "next";
 import "./globals.css";
+import "@/components/management.css";
 export const metadata: Metadata = { title: "专利导航 · 研究工作台", description: "以真实数据和原文证据推进专利导航研究" };
 export const viewport: Viewport = { width: "device-width", initialScale: 1, interactiveWidget: "resizes-content" };
 export default function RootLayout({ children }: Readonly<{ children: React.ReactNode }>) {

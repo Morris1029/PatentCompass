@@ -1,5 +1,8 @@
 """Concurrency and interrupted-run regressions for constrained research plans."""
 import pytest
+
+# These model doubles exercise compatibility with conversations created before the runtime migration.
+pytestmark = pytest.mark.usefixtures("legacy_conversation_runs")
 from fastapi.testclient import TestClient
 
 from app import jobs, model_provider, orchestration, report_service, semantic_service

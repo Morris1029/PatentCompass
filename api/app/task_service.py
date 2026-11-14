@@ -69,6 +69,11 @@ def cancel_run(session, run_id):
             material = session.get(Material, run.payload["material_id"])
             material.status = "cancelled"
         emit_event(session, run.id, "step.updated" if run.status == "cancelling" else "run.completed", {"status": run.status})
+        children = list(session.scalars(select(ResearchRun).where(
+            ResearchRun.payload["parent_run_id"].astext == run.id, ResearchRun.owner_id == run.owner_id,
+            ResearchRun.status.not_in(TERMINAL))))
+        for child in children:
+            cancel_run(session, child.id)
     return {"run_id": run.id, "status": run.status}
 
 

@@ -212,6 +212,8 @@ def make_message(session, project, conversation, message):
     session.flush()
     run = create_run(session, message.action, project, {"message_id": row.id, "report_mode": message.report_mode,
                      "semantic_mode": message.semantic_mode, "attachments": value["attachments"],
+                     **({"agent_runtime_version": 1} if get_settings().llm_enabled or message.action in {"auto", "chat"}
+                        or message.semantic_mode == "full" or message.report_mode == "ai" else {}),
                      **({"research_id": research.id} if research else {})}, conversation.id)
     if not research and message.action in {"chat", "auto"} and project.current_analysis_id:
         analysis = session.get(AnalysisResult, project.current_analysis_id)
@@ -1075,6 +1077,8 @@ def create_app(start_dispatcher=True):
     register(app)
     from app.capability_api import register as register_capabilities
     register_capabilities(app)
+    from app.management import register as register_management
+    register_management(app)
     return app
 
 

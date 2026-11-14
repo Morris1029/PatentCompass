@@ -2,6 +2,9 @@
 import json
 
 import pytest
+
+# These model doubles exercise compatibility with conversations created before the runtime migration.
+pytestmark = pytest.mark.usefixtures("legacy_conversation_runs")
 from sqlalchemy import select
 
 from app import chart_service, data_service, model_provider, orchestration, report_service, semantic_service

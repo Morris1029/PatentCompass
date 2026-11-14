@@ -253,7 +253,8 @@ def test_http_and_mcp_use_one_idempotency_record_and_the_same_statistics(client,
     async def verify():
         async with Client(server) as mcp:
             tools = await mcp.list_tools()
-            assert len(tools.tools) == 20
+            from app.agent_service import TOOLS
+            assert len(tools.tools) == 23 + len(TOOLS)
             result = await mcp.call_tool("build_report", {"request": {"records": records},
                                                          "idempotency_key": "cross-protocol-key"})
             assert not result.is_error, result

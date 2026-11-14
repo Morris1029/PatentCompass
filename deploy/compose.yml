@@ -56,6 +56,7 @@ services:
     volumes:
       - ../api/app:/workspace/api/app:ro
       - ../api/patentcompass_core:/workspace/api/patentcompass_core:ro
+      - ../api/patentcompass_agent:/workspace/api/patentcompass_agent:ro
       - ../storage:/workspace/storage
       - ../database:/workspace/database:ro
     init: true

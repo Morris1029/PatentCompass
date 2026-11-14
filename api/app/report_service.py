@@ -1,5 +1,7 @@
 """Immutable, evidence-backed statistical reports and Word exports."""
 
+from patentcompass_agent import read_prompt
+
 from copy import deepcopy
 import json
 from pathlib import Path
@@ -125,6 +127,12 @@ def _report_target(ctx):
             session.flush()
         research = research_for_context(session, ctx, report)
         ctx.guard(session)
+        if ctx.payload.get("external_agent"):
+            from app.agent_service import check_context
+            check_context(session, ctx)
+            if (research.current_revision_id != ctx.payload.get("expected_current_version_id")
+                    or report.current_version_id != ctx.payload.get("expected_adopted_version_id")):
+                raise AppError(409, "REPORT_VERSION_CONFLICT", "报告已变化，请重新核对")
         return {"report_id": report.id, "research_id": research.id,
                 "expected_current_version_id": research.current_revision_id,
                 "expected_research_revision": research.revision,
@@ -153,7 +161,7 @@ def generate_report(ctx):
 
         def synthesize():
             response = chat([
-                {"role": "system", "content": "请用中文总结给定专利样本事实。只引用给定编号，不新增计数，不判断法律状态或未检索的空白。"},
+                {"role": "system", "content": read_prompt('report-summary')},
                 {"role": "user", "content": json.dumps({"summary": snapshot["summary"],
                     "records": snapshot["representatives"]}, ensure_ascii=False)},
             ])
@@ -162,6 +170,9 @@ def generate_report(ctx):
         synthesis = ctx.step("report_synthesis", synthesize)
         content["blocks"].insert(1, {"id": str(uuid5(NAMESPACE_URL, f"{snapshot['analysis_id']}:ai-summary")),
                                     "type": "paragraph", "text": synthesis["text"], "origin": "model"})
+    if ctx.payload.get("external_agent") and ctx.payload.get("summary_text"):
+        content["blocks"].insert(1, {"id": str(uuid5(NAMESPACE_URL, f"{ctx.run_id}:agent-summary")),
+            "type": "paragraph", "text": ctx.payload["summary_text"], "origin": "agent"})
     ctx.check_cancelled()
     candidate = {**target, "content": content, "analysis_id": snapshot["analysis_id"],
         "scope_version_id": snapshot["scope_version_id"], "dataset_version_ids": snapshot["dataset_version_ids"],

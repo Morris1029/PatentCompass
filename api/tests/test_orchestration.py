@@ -3,6 +3,9 @@ from datetime import date
 from uuid import uuid4
 
 import pytest
+
+# These model doubles exercise compatibility with conversations created before the runtime migration.
+pytestmark = pytest.mark.usefixtures("legacy_conversation_runs")
 from fastapi.testclient import TestClient
 from sqlalchemy import select
 

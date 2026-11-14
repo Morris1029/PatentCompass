@@ -15,7 +15,7 @@ from starlette.applications import Starlette
 from starlette.routing import Mount
 import uvicorn
 
-from app import mcp_server
+from app import mcp_server, tool_service
 from app.errors import AppError
 
 
@@ -56,19 +56,20 @@ def controlled_mcp(monkeypatch):
         "search_patents": Spec(SearchInput, "Search fixed patent samples", False),
         "analyze_patents": Spec(SearchInput, "Submit analysis", True)}, invoke=invoke)
     monkeypatch.setattr(app, "capability_service", service, raising=False)
+    monkeypatch.setattr(tool_service, "capability_service", service)
     monkeypatch.setattr(mcp_server, "session_scope", session_scope)
-    monkeypatch.setattr(mcp_server.task_service, "get_run", lambda session, identifier: {"run_id": identifier, "status": "running"})
-    monkeypatch.setattr(mcp_server.task_service, "get_run_events", lambda session, identifier, after, limit: {
+    monkeypatch.setattr(tool_service.task_service, "get_run", lambda session, identifier: {"run_id": identifier, "status": "running"})
+    monkeypatch.setattr(tool_service.task_service, "get_run_events", lambda session, identifier, after, limit: {
         "run_id": identifier, "after": after, "limit": limit, "items": []})
-    monkeypatch.setattr(mcp_server.task_service, "cancel_run", lambda session, identifier: {"run_id": identifier, "status": "cancelling"})
-    monkeypatch.setattr(mcp_server.task_service, "retry_run", lambda session, identifier: {"run_id": "retry", "retry_of_id": identifier, "status": "queued"})
+    monkeypatch.setattr(tool_service.task_service, "cancel_run", lambda session, identifier: {"run_id": identifier, "status": "cancelling"})
+    monkeypatch.setattr(tool_service.task_service, "retry_run", lambda session, identifier: {"run_id": "retry", "retry_of_id": identifier, "status": "queued"})
 
     def idempotent(session, operation, key, payload, callback, status_code=200):
         if (operation, key) not in cached:
             cached[(operation, key)] = callback(), status_code
         return cached[(operation, key)]
 
-    monkeypatch.setattr(mcp_server, "idempotent", idempotent)
+    monkeypatch.setattr(tool_service, "idempotent", idempotent)
     server, application = mcp_server.create_mcp()
     return server, application, sessions, calls, cached
 
@@ -81,7 +82,9 @@ def test_mcp_discovers_typed_capabilities_and_calls_shared_services_in_own_threa
         async with Client(server) as client:
             listed = await client.list_tools()
             tools = {tool.name: tool for tool in listed.tools}
-            assert set(tools) == {"search_patents", "analyze_patents", "get_run", "get_run_events", "cancel_run", "retry_run"}
+            from app.agent_service import TOOLS
+            assert set(tools) == {"search_patents", "analyze_patents", "get_run", "get_run_events", "cancel_run", "retry_run",
+                                  "list_agent_skills", "load_agent_skill", "read_agent_reference"} | set(TOOLS)
             assert tools["search_patents"].input_schema["properties"]["request"]["$ref"].endswith("SearchInput")
             assert "idempotency_key" in tools["analyze_patents"].input_schema["required"]
             assert "idempotency_key" not in tools["search_patents"].input_schema["properties"]
@@ -164,7 +167,7 @@ def test_streamable_http_mount_lifespan_and_reconnect_keep_business_task_referen
         return result, status
 
     monkeypatch.setattr(app.capability_service, "invoke", submit)
-    monkeypatch.setattr(mcp_server.task_service, "get_run", lambda session, run_id: saved[run_id])
+    monkeypatch.setattr(tool_service.task_service, "get_run", lambda session, run_id: saved[run_id])
 
     @asynccontextmanager
     async def lifespan(app):

@@ -39,6 +39,25 @@ def buffered_chat_stream(monkeypatch):
     monkeypatch.setattr(model_provider, "stream_chat", stream)
 
 
+@pytest.fixture
+def legacy_conversation_runs(monkeypatch):
+    """Keep legacy protocol doubles testing persisted pre-runtime conversations.
+
+    New runtime/default-entry acceptance lives in test_agent_runtime.py. Existing
+    routing and streaming doubles deliberately speak the old model protocol.
+    """
+    from app import main
+    original = main.make_message
+
+    def create(*args, **kwargs):
+        result = original(*args, **kwargs)
+        run = args[0].get(ResearchRun, result["run_id"])
+        run.payload = {key: value for key, value in run.payload.items() if key != "agent_runtime_version"}
+        return result
+
+    monkeypatch.setattr(main, "make_message", create)
+
+
 @pytest.fixture(scope="session")
 def test_engine():
     url = make_url(os.environ.get("TEST_DATABASE_URL", get_settings().database_url)).set(database="patentcompass_test")

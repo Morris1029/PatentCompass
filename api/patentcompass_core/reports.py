@@ -1,5 +1,7 @@
 """Detached report construction and revision; no application state is required."""
 
+from patentcompass_agent import read_prompt
+
 from copy import deepcopy
 import json
 from uuid import NAMESPACE_URL, uuid5
@@ -293,7 +295,7 @@ def revise_report_content(content, operations=None, *, namespace="revision", cha
         if generate_callable is None:
             raise CapabilityError(503, "MODEL_NOT_CONFIGURED", "自然语言修改需要显式提供生成能力")
         response = generate_callable([
-            {"role": "system", "content": "只返回修改后的单个正文块文字。遵循指令，保留证据与数据边界，不虚构事实。沿用每项统计的原始总体和维度；申请人排名、IPC排名及年份分布是独立统计，未提供交叉统计时，不能写成某申请人主要涉及某IPC，也不能新增相关性或因果归因。压缩篇幅时优先保留样本范围和核心数量，不把省略的证据说成已全部保留。"},
+            {"role": "system", "content": read_prompt('report-rewrite')},
             {"role": "user", "content": json.dumps({"instruction": instruction,
                 "block": block, "source": result.get("source", {})}, ensure_ascii=False)},
         ])

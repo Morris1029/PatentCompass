@@ -9,6 +9,8 @@ import Chat from "./chat";
 import Workbench from "./workbench";
 import Report from "./report";
 import WorkspaceIcon, { type WorkspaceIconName } from "./workspace-icon";
+import Management, { UserMenu } from "./management";
+import { managementQuery } from "@/lib/management";
 
 export type Navigate = (changes: Record<string, string | null>) => void;
 const sections: { tab: string; label: string; icon: WorkspaceIconName }[] = [
@@ -20,6 +22,7 @@ const sections: { tab: string; label: string; icon: WorkspaceIconName }[] = [
 export default function Workspace() {
   const query = useSearchParams(); const router = useRouter(); const pathname = usePathname();
   const projectId = query.get("project"); const conversationId = query.get("conversation"); const view = query.get("view") || "chat";
+  const management = query.has("management");
   const { data: projects, error: projectsError } = useApi<Page>("/api/projects?limit=200");
   const { data: project, error: projectError } = useApi(projectId ? `/api/projects/${projectId}` : null, 6000);
   const { data: conversations } = useApi<Page>(projectId ? `/api/projects/${projectId}/conversations?limit=200` : null, 6000);
@@ -43,7 +46,7 @@ export default function Workspace() {
     return () => { document.body.style.overflow = previousOverflow; previous?.focus(); };
   }, [mobile]);
   const navigate: Navigate = changes => {
-    const next = new URLSearchParams(query.toString());
+    const next = new URLSearchParams(managementQuery(query.toString(), { management: null }));
     if (changes.project !== undefined && changes.project !== projectId) {
       for (const key of ["conversation", "research", "message", "version", "diff", "anchor", "analysis_id", "patent", "chart_id", "tab", "analysis"]) next.delete(key);
     }
@@ -53,6 +56,7 @@ export default function Workspace() {
     Object.entries(changes).forEach(([key, val]) => val === null ? next.delete(key) : next.set(key, val));
     router.push(`${pathname}?${next}`); setMobile(false);
   };
+  const manage: Navigate = changes => { router.push(`${pathname}?${managementQuery(query.toString(), changes)}`); setMobile(false); };
   const create = async (event: React.FormEvent) => {
     event.preventDefault(); if (!name.trim()) return; setBusy(true); setError(undefined);
     try { const result = await post("/api/projects", { name: name.trim(), scope: {} }); await refresh(); setCreating(false); setName(""); navigate({ project: result.id, conversation: null, view: "chat", version: null, anchor: null }); }
@@ -62,7 +66,7 @@ export default function Workspace() {
   const openSection = (tab: string) => navigate(view === "workbench" ? { tab } : { view: "workbench", research: researchId || null, tab, analysis: null, version: null, diff: null });
   const currentTab = query.get("tab") || "overview";
   const currentTitle = view === "workbench" ? sections.find(section => section.tab === currentTab)?.label || "范围与目标" : view === "report" ? "导航报告" : conversation?.title || "新对话";
-  return <div className={`${collapsed ? "sidebar-is-collapsed" : ""} ${mobile ? "mobile-sidebar-open" : ""} workspace-view-${view}`}>
+  return <div className={`${collapsed ? "sidebar-is-collapsed" : ""} ${mobile ? "mobile-sidebar-open" : ""} workspace-view-${management ? "management" : view}`}>
     <button className="mobile-nav-toggle icon-button" onClick={() => setMobile(true)} aria-label="打开项目导航">☰</button>
     {mobile && <button className="sidebar-backdrop" onClick={() => setMobile(false)} aria-label="关闭项目导航" />}
     <aside ref={sidebar} className={`workspace-sidebar ${collapsed ? "is-collapsed" : ""}`} aria-label="工作台导航" onKeyDown={e => { if (e.key === "Escape") setMobile(false); if (mobile && e.key === "Tab") { const items = Array.from(sidebar.current?.querySelectorAll<HTMLElement>("button,a") || []).filter(item => item.offsetParent !== null); const first = items[0]; const last = items.at(-1); if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last?.focus(); } else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first?.focus(); } } }}>
@@ -72,12 +76,12 @@ export default function Workspace() {
           <div className="project-heading"><button className="project-name" title={item.name} onClick={() => navigate({ project: item.id, conversation: null, view: "chat", version: null, anchor: null })}><span aria-hidden="true">◇</span><span className="sidebar-text">{item.name}</span></button><button className="project-add" aria-label={`在 ${item.name} 新建对话`} onClick={() => { if (item.id === projectId) draft(); else navigate({ project: item.id, conversation: null, view: "chat" }); }}>＋</button></div>
           {projectId === item.id && <div className="project-children"><button className="sidebar-link sidebar-new-conversation" onClick={draft} title="新建对话"><span className="sidebar-icon">＋</span><span className="sidebar-text">新建对话</span></button><span className="sidebar-caption">对话历史</span>{conversations?.items.map(conversation => <button key={conversation.id} className={`sidebar-link conversation-link ${conversationId === conversation.id && view === "chat" ? "active" : ""}`} onClick={() => navigate({ conversation: conversation.id, research: conversation.research_id || null, view: "chat", version: null, diff: null, anchor: null, message: null })} title={conversation.title}><span className="sidebar-icon"><WorkspaceIcon name="chat" size={17} /></span><span className="sidebar-text">{conversation.title}</span>{conversation.is_main && <small className="conversation-research-tag">{conversation.research_number ? `V${conversation.research_number}` : "新研究"}</small>}</button>)}{!conversations?.items.length && <p className="small muted sidebar-text">首次发送后保存</p>}</div>}
         </div>)}{!projects?.items.length && <p className="research-list-empty">还没有项目</p>}</div>
-      </nav><div className="sidebar-foot">行业专利导航助手</div>
+      </nav><UserMenu openManagement={() => manage({ management: "overview" })} />
     </aside>
-    <main className="workspace-main"><header className="workspace-header"><nav className="workspace-primary-nav" aria-label="功能导航"><div className="workspace-primary-sections">{sections.map(section => <button key={section.tab} disabled={!project || contextLoading} aria-current={view === "workbench" && currentTab === section.tab ? "page" : undefined} onClick={() => openSection(section.tab)}><WorkspaceIcon name={section.icon} /><span>{section.label}</span></button>)}</div><button className="workspace-report-link" disabled={!project} aria-current={view === "report" ? "page" : undefined} onClick={() => navigate({ view: "report", research: null, version: null, diff: null, anchor: null, message: null })}><WorkspaceIcon name="report" /><span>导航报告</span></button></nav><div className="workspace-topline conversation-context"><div className="workspace-project-title"><span className="project-context-icon"><WorkspaceIcon name="layout" /></span><div><span className="project-context-label">{project ? "当前项目" : "研究工作台"}</span><strong title={project?.name}>{project?.name || "从一个研究问题开始"}</strong></div></div>{project && <><span className="context-status">{research?.number ? `研究 V${research.number}` : research?.status === "draft" ? "新研究 · 未编号" : scopedProject?.dataset_version_id ? "已绑定专利数据" : "尚未选择数据"}</span><span className="context-view-title" title={currentTitle}>{currentTitle}</span><button className={`workspace-scope-link ${view === "workbench" && currentTab === "scope" ? "active" : ""}`} disabled={contextLoading} aria-current={view === "workbench" && currentTab === "scope" ? "page" : undefined} onClick={() => openSection("scope")}><WorkspaceIcon name="scope" size={17} /><span>范围与目标</span></button></>}</div></header>
+    <main className="workspace-main">{management && <Management search={new URLSearchParams(query.toString())} go={manage} projects={projects} />}<div className="workspace-business" hidden={management}><header className="workspace-header"><nav className="workspace-primary-nav" aria-label="功能导航"><div className="workspace-primary-sections">{sections.map(section => <button key={section.tab} disabled={!project || contextLoading} aria-current={view === "workbench" && currentTab === section.tab ? "page" : undefined} onClick={() => openSection(section.tab)}><WorkspaceIcon name={section.icon} /><span>{section.label}</span></button>)}</div><button className="workspace-report-link" disabled={!project} aria-current={view === "report" ? "page" : undefined} onClick={() => navigate({ view: "report", research: null, version: null, diff: null, anchor: null, message: null })}><WorkspaceIcon name="report" /><span>导航报告</span></button></nav><div className="workspace-topline conversation-context"><div className="workspace-project-title"><span className="project-context-icon"><WorkspaceIcon name="layout" /></span><div><span className="project-context-label">{project ? "当前项目" : "研究工作台"}</span><strong title={project?.name}>{project?.name || "从一个研究问题开始"}</strong></div></div>{project && <><span className="context-status">{research?.number ? `研究 V${research.number}` : research?.status === "draft" ? "新研究 · 未编号" : scopedProject?.dataset_version_id ? "已绑定专利数据" : "尚未选择数据"}</span><span className="context-view-title" title={currentTitle}>{currentTitle}</span><button className={`workspace-scope-link ${view === "workbench" && currentTab === "scope" ? "active" : ""}`} disabled={contextLoading} aria-current={view === "workbench" && currentTab === "scope" ? "page" : undefined} onClick={() => openSection("scope")}><WorkspaceIcon name="scope" size={17} /><span>范围与目标</span></button></>}</div></header>
       <ErrorNotice error={projectsError || projectError || conversationError || researchError} />
       {!project && projectId ? <Empty title="正在读取项目" /> : view === "report" ? project ? <Report key={project.id} project={project} navigate={navigate} /> : <Empty title="先创建或选择一个项目" /> : contextLoading ? <Empty title={conversationError || researchError ? "无法读取研究上下文" : "正在读取研究上下文"}>{(conversationError || researchError) && <button className="text-button" onClick={() => refresh()}>重试</button>}</Empty> : view === "workbench" ? scopedProject ? <Workbench key={`${project.id}:${researchId || "project"}`} project={scopedProject} navigate={navigate} /> : <Empty title="先创建或选择一个项目" /> : <Chat project={scopedProject} conversationId={conversationId} conversation={conversation} navigate={navigate} createProject={() => setCreating(true)} />}
-    </main>
+    </div></main>
     {creating && <Modal title="新建研究项目" close={() => setCreating(false)}><form onSubmit={create}><label className="form-field">项目名称<input autoFocus value={name} maxLength={300} onChange={e => setName(e.target.value)} placeholder="例如：无人机技术导航研究" required /></label><p className="small muted">项目共享数据和资料，各轮研究分别保留范围、分析与报告。</p><ErrorNotice error={error} /><div className="actions"><button className="btn primary" disabled={busy}>创建项目</button><button type="button" className="btn secondary" onClick={() => setCreating(false)}>取消</button></div></form></Modal>}
   </div>;
 }

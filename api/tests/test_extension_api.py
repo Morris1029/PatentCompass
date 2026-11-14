@@ -1,4 +1,5 @@
 from io import BytesIO
+import pytest
 
 from docx import Document
 from sqlalchemy import select
@@ -17,6 +18,7 @@ def document_bytes():
     return stream.getvalue()
 
 
+@pytest.mark.usefixtures("legacy_conversation_runs")
 def test_material_upload_attachment_only_and_project_isolation(client, api_dataset, monkeypatch):
     project_id = api_dataset["project"]["id"]
     path = f"/api/projects/{project_id}/materials"

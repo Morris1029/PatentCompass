@@ -2,7 +2,7 @@
 
 本轮在原仓库内分离可复用计算与项目业务。`api/patentcompass_core/` 不读取应用配置，也不依赖 `app`、数据库、Redis 或 Celery；`api/app/` 负责身份与资源归属、快照装配、任务、文件及版本发布。原前端继续使用已有项目接口。
 
-组件独立调用、HTTP 开放和 MCP 接入共用实现。这里没有为每个工具新建微服务，也没有接入 OpenAI Agents SDK、AgentScope 或 Skills。底层生成统一 Responses，不新增对外 Responses 聊天接口。
+组件独立调用、HTTP 开放和 MCP 接入共用实现。没有为每个工具新建微服务，也没有接入 OpenAI Agents SDK 或 AgentScope。独立主 Agent Prompt 和五项 Skills 位于 `api/patentcompass_agent/`，外部宿主可通过新增 MCP 工具提交推理结果并复用项目业务，见[迁移说明](portable-agent.md)。原底层生成统一 Responses，不新增对外 Responses 聊天接口。
 
 ## 能力边界
 

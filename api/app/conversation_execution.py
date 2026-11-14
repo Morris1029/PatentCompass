@@ -17,6 +17,7 @@ REPORT_ACTIONS = {"generate_report", "revise_report"}
 LABELS = {"search_patents": "检索专利", "search_materials": "检索项目资料", "analyze": "分析专利样本",
           "generate_report": "生成导航报告", "revise_report": "修改导航报告", "revise_chart": "修改图表",
           "scope": "更新研究范围"}
+LABELS.update(export="导出报告", restore_report="恢复历史报告")
 RESULT_FIELDS = {"matched_count", "report_version_id", "report_id", "analysis_id", "chart_version_id", "chart_id",
                  "file_id", "number", "parent_id", "download_url", "application_count", "query_counts",
                  "scope_application_count", "research_id", "research_number", "main_conversation_id", "source_message_id",

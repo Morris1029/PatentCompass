@@ -4,6 +4,9 @@ from uuid import uuid4
 
 import openpyxl
 import pytest
+
+# These model doubles exercise compatibility with conversations created before the runtime migration.
+pytestmark = pytest.mark.usefixtures("legacy_conversation_runs")
 from fastapi.testclient import TestClient
 from sqlalchemy import func, select
 
@@ -74,8 +77,10 @@ def test_all_29_business_operations_have_openapi_contracts(client):
     document = client.get("/openapi.json").json()
     operations = [(path, method, operation) for path, methods in document["paths"].items() if path.startswith("/api/")
                   for method, operation in methods.items()]
-    assert len([item for item in operations if not item[0].startswith("/api/capabilities")]) == 44
-    assert len(operations) == 47
+    assert len([item for item in operations if not item[0].startswith(("/api/capabilities", "/api/management"))]) == 44
+    management = [item for item in operations if item[0].startswith("/api/management")]
+    assert len(management) == 5 and all(item[1] == "get" for item in management)
+    assert len(operations) == 52
     for path, method, operation in operations:
         assert "responses" in operation, (method, path)
         assert "422" in operation["responses"], (method, path)

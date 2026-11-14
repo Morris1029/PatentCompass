@@ -21,6 +21,7 @@ COPY --from=renderer /renderer/node_modules ./chart-renderer/node_modules
 COPY api/chart-renderer/render.mjs ./chart-renderer/render.mjs
 COPY api/app ./app
 COPY api/patentcompass_core ./patentcompass_core
+COPY api/patentcompass_agent ./patentcompass_agent
 RUN groupadd --gid 10001 app \
     && useradd --uid 10001 --gid 10001 --create-home app \
     && mkdir -p /workspace/storage \

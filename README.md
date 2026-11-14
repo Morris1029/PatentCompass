@@ -4,7 +4,9 @@
 
 **当前阶段：前后端完整接入与样本验证。** `web/` 实现原型对应的真实工作区，连接 FastAPI 与持久化后台任务；支持样本导入、增量冲突确认、Word 资料、自然语言研究编排、全量语义分类、图表历史、报告编辑和指定版本 Word 导出。运行结果来自已保存的数据与成果；模型未配置时明确显示能力缺失，可继续使用统计分析。
 
-后端增加独立 Python 能力包 `api/patentcompass_core/`，提供解析、检索、统计、语义分类、报告和渲染能力；原前端继续使用现有接口，其他调用方可使用组件 HTTP API 或 `/mcp/`。所有底层文本生成统一调用 Responses，Embedding 仍使用独立接口。本轮不接入 Agent SDK、AgentScope 或 Skills；模型供应商的 Responses 兼容性需另行真实验证。使用方法见[组件说明](docs/capabilities.md)。
+后端提供独立 Python 能力包 `api/patentcompass_core/`，原前端继续使用现有接口，其他调用方可使用组件 HTTP API 或 `/mcp/`。`api/patentcompass_agent/` 保存独立主 Agent Prompt 和五项 Skills；外部 Agent 可完成专业推理，通过 MCP 提交结果，由原后端校验、统计、保存分析、发布报告及导出。原生成入口继续使用 Responses，Embedding 独立配置。见[组件说明](docs/capabilities.md)和[Agent / Skills 迁移说明](docs/portable-agent.md)。
+
+原系统的新模型对话也使用统一内置 Agent 运行层：完整加载主 Prompt、按需读取 Skills，并与 MCP 共用工具契约和后端业务逻辑。原确认、研究归属、版本、证据、任务恢复和确定性统计功能继续保留；实际对话入口验收方法见[迁移说明](docs/portable-agent.md)。
 
 ## 后端开发
 

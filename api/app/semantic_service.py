@@ -3,6 +3,8 @@
 import copy
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+from patentcompass_agent import prompt_version
+
 from patentcompass_core.semantics import (
     BATCH_SIZE, DIMENSIONS, DIMENSION_LABELS, PROMPT_VERSION, REVIEW_LABELS, SCHEMA_VERSION,
     TAXONOMY_PROMPT_VERSION, _digest, analysis_draft, assemble_taxonomy, assign_themes as _assign,
@@ -28,7 +30,7 @@ from app.models import (AnalysisResult, Chart, DatasetVersion, Evidence, PatentA
 def _cache_key(patent, model):
     return _digest({"text_sha256": _text_hash(patent), "model": model,
                     "model_options": getattr(get_settings(), "llm_extra_body", {}),
-                    "prompt_version": PROMPT_VERSION, "schema_version": SCHEMA_VERSION})
+                    "prompt_version": prompt_version("semantic-extraction", PROMPT_VERSION), "schema_version": SCHEMA_VERSION})
 
 
 def _extract_batch(ctx, patents, model):
@@ -49,7 +51,7 @@ def _extract_batch(ctx, patents, model):
                 key = keys[patent.id]
                 saved = session.scalar(insert(SemanticCache).values(
                     id=new_id(), cache_key=key, text_sha256=_text_hash(patent), model=model,
-                    prompt_version=PROMPT_VERSION, schema_version=SCHEMA_VERSION, extraction=extraction
+                    prompt_version=prompt_version("semantic-extraction", PROMPT_VERSION), schema_version=SCHEMA_VERSION, extraction=extraction
                 ).on_conflict_do_nothing(index_elements=[SemanticCache.cache_key]).returning(SemanticCache.extraction))
                 cached[key] = saved if saved is not None else session.scalar(select(SemanticCache.extraction).where(SemanticCache.cache_key == key))
             ctx.guard(session)
@@ -58,6 +60,7 @@ def _extract_batch(ctx, patents, model):
 
 
 def _taxonomy(ctx, extractions):
+    version = prompt_version("semantic-taxonomy", TAXONOMY_PROMPT_VERSION)
     labels = taxonomy_labels(extractions)
     if not any(labels.values()):
         return {"version": _digest(labels), "themes": {dimension: [] for dimension in DIMENSIONS}, "mapping": {}}
@@ -65,13 +68,13 @@ def _taxonomy(ctx, extractions):
     labels_hash = _digest(labels)
     cache_key = _digest({"labels_hash": labels_hash, "model": model,
                         "model_options": getattr(get_settings(), "llm_extra_body", {}),
-                        "prompt_version": TAXONOMY_PROMPT_VERSION, "schema_version": SCHEMA_VERSION})
+                        "prompt_version": version, "schema_version": SCHEMA_VERSION})
     with session_scope() as session:
         cached = session.scalar(select(SemanticCache).where(SemanticCache.cache_key == cache_key))
         if cached:
             return cached.extraction
     dimension_keys = {dimension: _digest({"labels": values, "model": model, "dimension": dimension,
-        "model_options": getattr(get_settings(), "llm_extra_body", {}), "prompt_version": TAXONOMY_PROMPT_VERSION,
+        "model_options": getattr(get_settings(), "llm_extra_body", {}), "prompt_version": version,
         "schema_version": SCHEMA_VERSION}) for dimension, values in labels.items()}
     with session_scope() as session:
         dimension_cache = {row.cache_key: row.extraction for row in session.scalars(select(SemanticCache).where(
@@ -95,7 +98,7 @@ def _taxonomy(ctx, extractions):
             with session_scope() as session:
                 key = dimension_keys[dimension]
                 saved = session.scalar(insert(SemanticCache).values(id=new_id(), cache_key=key, text_sha256=_digest(labels[dimension]),
-                        model=model, prompt_version=f"{TAXONOMY_PROMPT_VERSION}-{dimension}", schema_version=SCHEMA_VERSION,
+                        model=model, prompt_version=f"{version}-{dimension}", schema_version=SCHEMA_VERSION,
                         extraction=result).on_conflict_do_nothing(index_elements=[SemanticCache.cache_key]).returning(SemanticCache.extraction))
                 results[dimension] = saved if saved is not None else session.scalar(select(SemanticCache.extraction).where(SemanticCache.cache_key == key))
                 ctx.guard(session)
@@ -106,7 +109,7 @@ def _taxonomy(ctx, extractions):
     taxonomy = assemble_taxonomy(labels, results)
     with session_scope() as session:
         saved = session.scalar(insert(SemanticCache).values(id=new_id(), cache_key=cache_key, text_sha256=labels_hash,
-                        model=model, prompt_version=TAXONOMY_PROMPT_VERSION, schema_version=SCHEMA_VERSION, extraction=taxonomy)
+                        model=model, prompt_version=version, schema_version=SCHEMA_VERSION, extraction=taxonomy)
                         .on_conflict_do_nothing(index_elements=[SemanticCache.cache_key]).returning(SemanticCache.extraction))
         taxonomy = saved if saved is not None else session.scalar(select(SemanticCache.extraction).where(SemanticCache.cache_key == cache_key))
         ctx.guard(session)
@@ -125,14 +128,21 @@ def _persist(ctx, patents, assignments, taxonomy, cached_count, revision_of_id=N
         existing = session.scalar(select(AnalysisResult).where(AnalysisResult.run_id.in_(run_ids)))
         if existing:
             return {**_analysis_result(session, existing), **existing.summary.get("semantic", {})}
+        if ctx.payload.get("external_agent"):
+            from app.agent_service import check_context
+            check_context(session, ctx)
         publications = list(session.scalars(select(PatentPublication).where(PatentPublication.application_id.in_([p.id for p in patents]))))
         versions = list(session.scalars(select(DatasetVersion).where(DatasetVersion.id.in_(ctx.dataset_version_ids))))
         base = session.get(AnalysisResult, revision_of_id) if revision_of_id else None
         source_model = base.summary.get("semantic", {}).get("model", "") if base else get_settings().llm_model
+        if ctx.payload.get("external_agent"):
+            source_model = ctx.payload["agent_model"]
         classification = {"source": classification_source(patents), "assignments": assignments, "taxonomy": taxonomy,
                           "coverage": {"cached_count": cached_count, "model": source_model}}
         draft = analysis_draft(patents, classification, versions, publications)
         coverage = draft["summary"]["semantic"]
+        if ctx.payload.get("external_agent"):
+            coverage["agent"] = {"model": ctx.payload["agent_model"], "skill_version": ctx.payload["skill_version"]}
         analysis = AnalysisResult(id=new_id(), project_id=ctx.project_id, run_id=ctx.run_id, scope_version_id=ctx.scope_version_id,
                                   dataset_version_ids=ctx.dataset_version_ids, patent_ids=draft["patent_ids"],
                                   summary=draft["summary"], revision_of_id=revision_of_id)
@@ -187,7 +197,7 @@ def analyze(ctx):
         cached_count += result["cached_count"]
         ctx.emit("analysis.progress", {"processed_count": len(extractions), "total_count": len(patents),
                                        "cached_count": cached_count, "stage": "extract"})
-    taxonomy = ctx.step("semantic_taxonomy_" + TAXONOMY_PROMPT_VERSION + "_" + _digest(extractions)[:16], lambda: _taxonomy(ctx, extractions))
+    taxonomy = ctx.step("semantic_taxonomy_" + prompt_version("semantic-taxonomy", TAXONOMY_PROMPT_VERSION) + "_" + _digest(extractions)[:16], lambda: _taxonomy(ctx, extractions))
     assignments = _assign(extractions, taxonomy)
     result = ctx.step("persist_semantic_analysis", lambda: _persist(ctx, patents, assignments, taxonomy, cached_count))
     ctx.emit("analysis.ready", result)

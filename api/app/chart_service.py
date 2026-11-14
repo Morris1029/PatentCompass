@@ -1,5 +1,7 @@
 """Immutable, independently adopted chart history and snapshot-based revisions."""
 
+from patentcompass_agent import read_prompt
+
 import copy
 import json
 from collections import defaultdict
@@ -195,8 +197,8 @@ def revise_chart(ctx):
                     PatentApplication.id.in_(base["provenance"].get("application_ids", [])))
                     .order_by(PatentApplication.id).limit(8)))
                 evidence = [{"application_id": p.id, "title": p.title, "abstract": p.abstract} for p in patents]
-            message = model_provider.chat([
-                {"role": "system", "content": "你负责解释冻结版本的专利样本图表。仅根据所给程序统计与原文说明，不能推导未提供的申请人×IPC关系、技术空白或法律结论。区分样本与全集，明确限制。证据不足时明确说明。"},
+            message = {"content": payload["interpretation"]} if payload.get("external_agent") else model_provider.chat([
+                {"role": "system", "content": read_prompt('chart-insight')},
                 {"role": "user", "content": json.dumps({"instruction": payload.get("instruction", "解释这张图表"),
                  "chart_data": base["data"], "evidence": evidence}, ensure_ascii=False)}])
             text = message.get("content")
