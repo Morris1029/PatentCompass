@@ -240,7 +240,8 @@ def execute_run(run_id: str):
     try:
         _confirm_scope(ctx)
         from app import chart_service, data_service, materials_service, merge_service, orchestration, report_service, semantic_service
-        handlers = {"import": data_service.import_dataset, "analyze": run_analysis,
+        from app.capability_service import execute_capability
+        handlers = {"capability": execute_capability, "import": data_service.import_dataset, "analyze": run_analysis,
                     "index": data_service.build_embeddings, "generate_report": report_service.generate_report,
                     "revise_report": report_service.revise_report, "restore_report": report_service.restore_report, "export": report_service.export_report,
                     "chat": _chat, "auto": orchestration.execute, "parse_material": materials_service.parse_material,
@@ -355,8 +356,7 @@ class AnalysisRead(BaseModel):
 
 
 def _chat(ctx):
-    from app import data_service
-    from app.models import AnalysisResult, Material, MaterialBlock, Message, Project, ReportVersion
+    from app.models import AnalysisResult, Message, Project, ReportVersion
     with session_scope() as session:
         seen, run_id = set(), ctx.run_id
         while run_id and run_id not in seen:
@@ -428,7 +428,8 @@ def _chat(ctx):
             break
         if turn == 3 or len(calls) > 4:
             raise AppError(422, "TOOL_LIMIT_REACHED", "本次检索步骤达到上限，请缩小问题后重试")
-        prompt.append({"role": "assistant", "content": response.get("content"), "tool_calls": calls})
+        prompt.append({"role": "assistant", "content": response.get("content"), "tool_calls": calls,
+                       **{key: response[key] for key in ("_response_items", "_generation_protocol") if key in response}})
         requests = []
         for call in calls:
             try:
@@ -448,45 +449,11 @@ def _chat(ctx):
             require_execution(ctx, searches)
         for index, (tool_name, filters, call_id) in enumerate(requests):
             def retrieve():
+                from app.capability_service import conversation_tool
                 with session_scope() as session:
-                    if tool_name == "read_analysis":
-                        if not analysis:
-                            return {"status": "unavailable", "reason": "此任务未绑定冻结分析", "records": []}
-                        from copy import deepcopy
-                        view = deepcopy(analysis.views.get(filters["view"], {}))
-                        view.pop("evidence_ids", None)
-                        view.pop("chart_ids", None)
-                        data = view.get("data")
-                        if isinstance(data, dict):
-                            data.pop("memberships", None)
-                            data.pop("review_records", None)
-                        return {"analysis_id": analysis.id, "view": filters["view"], "result": view, "records": []}
-                    if tool_name == "search_materials":
-                        blocks = session.scalars(select(MaterialBlock).join(Material).where(
-                            Material.project_id == ctx.project_id, Material.status == "ready",
-                            MaterialBlock.text.ilike(f"%{filters['q']}%"))).all()
-                        return {"matched_count": len(blocks), "records": [
-                            {"id": block.id, "material_id": block.material_id, "text": block.text,
-                             "kind": block.kind, "location": block.location} for block in blocks[:10]]}
-                    project = session.get(Project, ctx.project_id)
-                    query_filters = {key: value for key, value in filters.items() if key != "queries"}
-                    query = {**query_filters, "scope_version_id": ctx.scope_version_id,
-                             "dataset_version_ids": ctx.dataset_version_ids, "mode": "keywords"}
-                    if analysis:
-                        query["application_ids"] = analysis.patent_ids
-                    searches = filters.get("queries") or [filters.get("q", "")]
-                    records, counts = {}, []
-                    for search in searches:
-                        found = data_service.search_patents(session, project, {**query, "q": search})
-                        counts.append({"query": search, "matched_count": len(found["items"])})
-                        records.update({item.id: item for item in found["items"]})
-                    return {"matched_count": len(records), "query_counts": counts,
-                            "query_semantics": "单式空格AND，多式并集去重；零命中仅适用于实际检索式",
-                            "scope_application_count": found["scope_application_count"],
-                            "records": [{"id": item.id, "application_number": item.application_number,
-                                         "title": item.title, "abstract": item.abstract, "source_sheet": item.source_sheet,
-                                         "source_row": item.source_row, "dataset_version_id": item.dataset_version_id}
-                                        for item in list(records.values())[:10]]}
+                    return conversation_tool(session, tool_name, filters, project_id=ctx.project_id,
+                        scope_version_id=ctx.scope_version_id, dataset_version_ids=ctx.dataset_version_ids,
+                        analysis_id=analysis.id if analysis else None)
             key = f"chat_search_{turn}_{index}"
             if tool_name in {"search_patents", "search_materials"}:
                 require_execution(ctx, [tool_name])

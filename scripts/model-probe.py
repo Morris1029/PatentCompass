@@ -14,7 +14,7 @@ sys.path.insert(0, str(ROOT / "api"))
 os.chdir(ROOT / "api")
 
 from app.config import get_settings
-from app.model_provider import _post, embed
+from app.model_provider import chat, embed
 
 
 def run(kind):
@@ -25,11 +25,11 @@ def run(kind):
               "host": urlsplit(getattr(settings, f"{prefix}_base_url")).hostname}
     try:
         if kind == "chat":
-            response = _post("chat/completions", {"messages": [{"role": "user", "content": "只回复 API_OK，不要附加解释。"}]})
-            content = response["choices"][0]["message"]["content"]
+            response = chat([{"role": "user", "content": "只回复 API_OK，不要附加解释。"}])
+            content = response["content"]
             if not isinstance(content, str) or not content.strip():
                 raise ValueError("Provider returned no answer")
-            result.update(status="passed", response=content[:100], usage=response.get("usage"))
+            result.update(status="passed", protocol="responses-v1", response=content[:100], usage=response.get("usage"))
         else:
             vectors = embed(["无人机自主降落", "Unmanned aerial vehicle autonomous landing"])
             result.update(status="passed", count=len(vectors), dimensions=[len(vector) for vector in vectors])

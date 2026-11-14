@@ -16,14 +16,16 @@ from sqlalchemy import func, select, text, tuple_
 from sqlalchemy.orm import Session
 from starlette.exceptions import HTTPException
 
-from app import db, schemas
+from app import db, schemas, task_service
+from app.resource_service import record, owned, idempotent, public_value
+from app.task_service import research_record
 from app.config import get_settings
 from app.errors import AppError
 from app.files import resolve_file, store_bytes
 from app.jobs import TERMINAL, create_run, dispatch_pending, emit_event
 from app.models import (AnalysisResult, Chart, Conversation, Dataset, DatasetVersion, Evidence,
-                        IdempotencyRequest, Message, PatentApplication, PatentPublication, Project,
-                        Report, ReportVersion, ResearchVersion, ResearchRun, RunEvent, RunStep, ScopeVersion, StoredFile,
+                        Message, PatentApplication, PatentPublication, Project,
+                        Report, ReportVersion, ResearchVersion, ResearchRun, RunEvent, ScopeVersion, StoredFile,
                         ChartVersion, DatasetSource, ImportConflict, Material, MaterialBlock, new_id, utcnow)
 
 logger = logging.getLogger(__name__)
@@ -37,37 +39,8 @@ def session_dependency():
 DB = Annotated[Session, Depends(session_dependency, scope="function")]
 
 
-def record(row, exclude=()):
-    return jsonable_encoder({column.key: getattr(row, column.key) for column in row.__table__.columns
-                             if column.key not in exclude})
 
 
-def owned(session, model, object_id, lock=False):
-    try:
-        object_id = str(UUID(str(object_id)))
-    except (ValueError, TypeError, AttributeError):
-        raise AppError(422, "INVALID_RESOURCE_ID", "资源标识无效")
-    query = select(model).where(model.id == str(object_id))
-    if lock:
-        query = query.with_for_update().execution_options(populate_existing=True)
-    row = session.scalar(query)
-    if not row:
-        raise AppError(404, "NOT_FOUND", "记录不存在")
-    if hasattr(row, "owner_id"):
-        permitted = row.owner_id == get_settings().dev_owner_id
-    elif isinstance(row, DatasetVersion):
-        permitted = session.get(Dataset, row.dataset_id).owner_id == get_settings().dev_owner_id
-    elif isinstance(row, (ReportVersion, ResearchVersion)):
-        permitted = session.get(Project, session.get(Report, row.report_id).project_id).owner_id == get_settings().dev_owner_id
-    elif isinstance(row, Message):
-        permitted = session.get(Project, session.get(Conversation, row.conversation_id).project_id).owner_id == get_settings().dev_owner_id
-    elif hasattr(row, "project_id"):
-        permitted = session.get(Project, row.project_id).owner_id == get_settings().dev_owner_id
-    else:
-        permitted = False
-    if not permitted:
-        raise AppError(404, "NOT_FOUND", "记录不存在")
-    return row
 
 
 def paginate(rows, limit, cursor=None, reverse=False):
@@ -109,25 +82,8 @@ def ranked_page(found, limit, cursor):
 
 
 def mutate(session, request, response, payload, callback, status_code=200):
-    key = request.headers.get("Idempotency-Key") or request.state.request_id
-    if len(key) > 200:
-        raise AppError(422, "INVALID_IDEMPOTENCY_KEY", "幂等标识不能超过 200 字符")
-    operation = request.method + " " + request.url.path
-    owner = get_settings().dev_owner_id
-    digest = hashlib.sha256(json.dumps(jsonable_encoder(payload), sort_keys=True, ensure_ascii=False).encode()).hexdigest()
-    session.execute(text("SELECT pg_advisory_xact_lock(hashtextextended(:key, 0))"),
-                    {"key": owner + operation + key})
-    previous = session.scalar(select(IdempotencyRequest).where(IdempotencyRequest.owner_id == owner,
-                              IdempotencyRequest.operation == operation, IdempotencyRequest.client_key == key))
-    if previous:
-        if previous.request_hash != digest:
-            raise AppError(409, "IDEMPOTENCY_CONFLICT", "同一幂等标识不能提交不同内容")
-        response.status_code = previous.status_code
-        return previous.response
-    value = jsonable_encoder(callback())
-    session.add(IdempotencyRequest(owner_id=owner, operation=operation, client_key=key,
-                                  request_hash=digest, response=value, status_code=status_code))
-    response.status_code = status_code
+    value, response.status_code = idempotent(session, request.method + " " + request.url.path,
+        request.headers.get("Idempotency-Key") or request.state.request_id, payload, callback, status_code)
     return value
 
 
@@ -177,17 +133,6 @@ def research_for(session, project, research_id):
     return research
 
 
-def research_record(session, research):
-    from app.research_service import context_for
-    context = context_for(session, research)
-    scope = session.get(ScopeVersion, context.get("scope_version_id")) if context.get("scope_version_id") else None
-    head = session.execute(select(ReportVersion.content["title"].label("title"), ReportVersion.created_at)
-                           .where(ReportVersion.id == research.current_revision_id)).first() if research.current_revision_id else None
-    return {**record(research), "current_version_id": research.current_revision_id,
-            "title": head.title if head else "新一轮研究", "updated_at": head.created_at if head else research.created_at,
-            "context": {**context, "scope": record(scope) if scope else None,
-                        "dataset_version_id": next(iter(context.get("dataset_version_ids", [])), None),
-                        "current_analysis_id": context.get("analysis_id"), "revision": research.revision}}
 
 
 def revision_metadata(session, value):
@@ -297,19 +242,27 @@ async def _dispatcher(stop):
 
 
 def create_app(start_dispatcher=True):
+    from app.mcp_server import create_mcp
+    mcp_server, mcp_app = create_mcp()
+
     @asynccontextmanager
     async def lifespan(app):
-        stop = asyncio.Event()
-        task = asyncio.create_task(_dispatcher(stop)) if start_dispatcher else None
-        yield
-        stop.set()
-        if task:
-            await task
+        async with mcp_server.session_manager.run():
+            stop = asyncio.Event()
+            task = asyncio.create_task(_dispatcher(stop)) if start_dispatcher else None
+            try:
+                yield
+            finally:
+                stop.set()
+                if task:
+                    await task
 
     app = FastAPI(title="PatentCompass API", version="0.1.0", lifespan=lifespan,
                   responses={400: {"model": schemas.ErrorResponse}, 404: {"model": schemas.ErrorResponse},
                              409: {"model": schemas.ErrorResponse}, 422: {"model": schemas.ErrorResponse},
                              503: {"model": schemas.ErrorResponse}})
+
+    app.mount("/mcp", mcp_app)
 
     @app.middleware("http")
     async def request_id(request, call_next):
@@ -673,28 +626,7 @@ def create_app(start_dispatcher=True):
 
     @app.get("/api/runs/{id}", response_model=schemas.RunResponse, tags=["runs"])
     def run_status(id: UUID, session: DB):
-        from app.conversation_execution import activities_for_run
-        from app.chat_streaming import stream_for_run
-        run = owned(session, ResearchRun, id)
-        steps = session.scalars(select(RunStep).where(RunStep.run_id == run.id).order_by(RunStep.created_at)).all()
-        input_request = dict(run.input_request) if run.input_request else None
-        if input_request and input_request["kind"] == "import_conflicts":
-            input_request["conflicts"] = [record(row) for row in session.scalars(select(ImportConflict).where(
-                ImportConflict.version_id == run.payload["dataset_version_id"], ImportConflict.resolution.is_(None)))]
-        if input_request and input_request["kind"] in {"scope_confirmation", "plan_confirmation", "execution_confirmation"}:
-            from app.conversation_execution import scope_editable_for_run
-            scope = session.get(ScopeVersion, run.scope_version_id)
-            input_request["scope"] = {**(scope.content if scope else {}), **input_request.get("scope", {}),
-                                      **input_request.get("changes", {})}
-            input_request["scope_editable"] = (scope_editable_for_run(run)
-                                               if input_request["kind"] == "execution_confirmation" else True)
-        return {**record(run, exclude=("lease_token", "payload")), "steps": [record(item) for item in steps],
-                "research_id": run.payload.get("research_id"),
-                "context": research_record(session, session.get(ResearchVersion, run.payload["research_id"]))["context"] if run.payload.get("research_id") else None,
-                "input_request": input_request, "plan": run.payload.get("plan"),
-                "origin_message_id": run.payload.get("message_id") or session.scalar(select(Message.id).where(
-                    Message.run_id == run.id, Message.role == "user")), "activities": activities_for_run(session, run),
-                "stream": stream_for_run(session, run)}
+        return task_service.get_run(session, id)
 
     @app.get("/api/runs/{id}/events", tags=["runs"], response_class=StreamingResponse,
              responses={200: {"content": {"text/event-stream": {"schema": {"type": "string"}}}}})
@@ -717,7 +649,7 @@ def create_app(start_dispatcher=True):
                     events = inner.scalars(select(RunEvent).where(RunEvent.run_id == run_id, RunEvent.seq > after)
                                            .order_by(RunEvent.seq).limit(200)).all()
                     state = inner.get(ResearchRun, run_id).status
-                    return [record(event) for event in events], state
+                    return [public_value(record(event)) for event in events], state
             while True:
                 events, state = await asyncio.to_thread(batch)
                 for event in events:
@@ -891,46 +823,11 @@ def create_app(start_dispatcher=True):
 
     @app.post("/api/runs/{id}/cancel", response_model=schemas.TaskResponse, tags=["runs"])
     def cancel_run(id: UUID, request: Request, response: Response, session: DB):
-        def action():
-            run = owned(session, ResearchRun, id, lock=True)
-            if run.status not in TERMINAL:
-                run.cancellation_requested = True
-                run.status = "cancelling" if run.status in {"running", "cancelling"} else "cancelled"
-                run.dispatch_pending = False
-                if run.kind in {"import", "merge_import"} and run.status == "cancelled":
-                    version = session.get(DatasetVersion, run.payload["dataset_version_id"])
-                    if version.status != "ready":
-                        version.status = "cancelled"
-                if run.kind == "parse_material" and run.status == "cancelled":
-                    material = session.get(Material, run.payload["material_id"])
-                    if material and material.status != "ready":
-                        material.status = "cancelled"
-                emit_event(session, run.id, "step.updated" if run.status == "cancelling" else "run.completed", {"status": run.status})
-            return task_result(run)
-        return mutate(session, request, response, {}, action)
+        return mutate(session, request, response, {}, lambda: task_service.cancel_run(session, id))
 
     @app.post("/api/runs/{id}/retry", response_model=schemas.TaskResponse, status_code=202, tags=["runs"])
     def retry_run(id: UUID, request: Request, response: Response, session: DB):
-        def action():
-            old = owned(session, ResearchRun, id, lock=True)
-            if old.status != "failed":
-                raise AppError(409, "RUN_NOT_FAILED", "只能重试失败任务")
-            run = create_run(session, old.kind, payload=dict(old.payload), conversation_id=old.conversation_id, retry_of_id=old.id)
-            run.project_id, run.scope_version_id, run.dataset_version_ids = old.project_id, old.scope_version_id, list(old.dataset_version_ids)
-            origin = (session.get(Message, old.payload["message_id"]) if old.payload.get("message_id") else
-                      session.scalar(select(Message).where(Message.run_id == old.id, Message.role == "user")))
-            if origin and origin.role == "user" and origin.conversation_id == old.conversation_id:
-                origin.run_id = run.id
-                origin.cards = [card for card in origin.cards if card.get("type") != "task"]
-            if old.kind == "parse_material":
-                material = session.get(Material, old.payload["material_id"])
-                material.run_id, material.status, material.error = run.id, "pending", None
-            if old.kind in {"import", "merge_import"}:
-                version = session.get(DatasetVersion, old.payload["dataset_version_id"])
-                if version.status != "ready":
-                    version.status = "pending"
-            return task_result(run, retry_of_id=old.id)
-        return mutate(session, request, response, {}, action, 202)
+        return mutate(session, request, response, {}, lambda: task_service.retry_run(session, id), 202)
 
     @app.get("/api/projects/{id}/analysis", response_model=schemas.AnalysisResponse, tags=["analysis"])
     def analysis_view(id: UUID, session: DB, run_id: UUID | None = None, view: str = "overview", analysis_id: UUID | None = None,
@@ -1176,6 +1073,8 @@ def create_app(start_dispatcher=True):
 
     from app.extension_api import register
     register(app)
+    from app.capability_api import register as register_capabilities
+    register_capabilities(app)
     return app
 
 

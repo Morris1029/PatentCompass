@@ -1,12 +1,8 @@
 """CNIPA spreadsheet ingestion, reproducible retrieval and statistical analysis."""
 
 import hashlib
-import re
-from collections import Counter, defaultdict
-from datetime import date, datetime
-from pathlib import Path
+from datetime import date
 
-import openpyxl
 from sqlalchemy import Text, cast, exists, func, or_, select
 
 from app.config import get_settings
@@ -18,151 +14,11 @@ from app.models import (AnalysisResult, Chart, DatasetVersion, Evidence, PatentA
                         PatentEmbedding, PatentPublication, Project, ResearchRun, ScopeVersion, StoredFile, new_id)
 
 
-HEADERS = {
-    "申请号": "application_number", "公开（公告）号": "publication_numbers", "申请日": "application_date",
-    "公开（公告）日": "publication_dates", "IPC分类号": "ipc_codes", "申请（专利权）人": "applicants",
-    "发明人": "inventors", "发明名称": "title", "优先权号": "priority_numbers", "优先权日": "priority_dates",
-    "文献类型": "document_type", "申请人所在国（省）": "countries", "摘要": "abstract",
-}
-REQUIRED = {"application_number", "publication_numbers", "application_date", "publication_dates", "title", "abstract"}
-COUNTING_METHOD = {"unit": "application", "applicants": "full_count", "ipc": "multi_label_full_count",
-                   "year": "application_date", "coverage": "imported_sample_only"}
-KEYWORD_EXPANSIONS = {
-    "无人机": ["unmanned aerial vehicle", "uav", "drone"],
-    "自主": ["autonomous", "automatic"], "降落": ["landing", "land"],
-    "起飞": ["takeoff", "take-off"], "避障": ["obstacle avoidance", "collision avoidance"],
-    "导航": ["navigation", "navigating"], "电池": ["battery", "batteries"],
-    "控制": ["control"], "通信": ["communication"], "路径规划": ["path planning", "route planning"],
-}
-
-
-def _text(value) -> str:
-    return "" if value is None else str(value).strip()
-
-
-def split_values(value) -> list[str]:
-    return [part.strip() for part in re.split(r"[;；\n\r]+", _text(value)) if part.strip()]
-
-
-def _date(value) -> date:
-    if isinstance(value, datetime):
-        return value.date()
-    if isinstance(value, date):
-        return value
-    text = _text(value)
-    for pattern in ("%Y.%m.%d", "%Y-%m-%d", "%Y/%m/%d", "%Y%m%d"):
-        try:
-            return datetime.strptime(text, pattern).date()
-        except ValueError:
-            continue
-    raise ValueError(f"无效日期: {text}")
-
-
-def _priorities(number_value, date_value) -> list[dict]:
-    numbers = split_values(number_value)
-    dates = [_date(value).isoformat() for value in split_values(date_value)]
-    priorities = []
-    for index, value in enumerate(numbers):
-        # CNIPA exports a date per number inside the number cell, while the date
-        # column can contain only distinct dates; positional zipping would lose rows.
-        match = re.fullmatch(r"(.+?)\s+(\d{8})", value)
-        embedded_date = _date(match.group(2)).isoformat() if match else None
-        if embedded_date and dates and embedded_date not in dates:
-            raise ValueError("优先权号内日期与优先权日期列不一致")
-        if embedded_date:
-            priority_date = embedded_date
-        elif len(dates) == len(numbers):
-            priority_date = dates[index]
-        elif len(dates) == 1:
-            priority_date = dates[0]
-        elif dates:
-            raise ValueError("无法确定优先权号与日期的对应关系")
-        else:
-            priority_date = None
-        priorities.append({"number": match.group(1) if match else value, "date": priority_date, "raw": value})
-    return priorities
-
-
-def parse_workbook(path: str | Path) -> dict:
-    """Parse all non-empty rows. Any invalid row makes the version fail, never silently disappear."""
-    applications, errors, sheets, missing_fields = [], [], [], Counter()
-    seen_applications, seen_publications = set(), set()
-    try:
-        workbook = openpyxl.load_workbook(path, read_only=True, data_only=True)
-    except Exception as exc:
-        raise AppError(422, "INVALID_WORKBOOK", "无法读取 Excel 文件") from exc
-    try:
-        for sheet in workbook:
-            iterator = sheet.iter_rows(values_only=True)
-            header = [_text(item) for item in next(iterator, [])]
-            if not any(header):
-                continue
-            mapped = {HEADERS[name]: index for index, name in enumerate(header) if name in HEADERS}
-            missing = sorted(REQUIRED - mapped.keys())
-            sheets.append({"name": sheet.title, "headers": header, "missing_columns": missing})
-            if missing:
-                errors.append({"sheet": sheet.title, "row": 1, "code": "MISSING_COLUMNS", "fields": missing})
-            for row_number, row in enumerate(iterator, 2):
-                if not any(_text(value) for value in row):
-                    continue
-                raw = {header[index] or f"column_{index + 1}":
-                       value.isoformat() if isinstance(value, (date, datetime)) else value
-                       for index, value in enumerate(row) if index < len(header)}
-                values = {key: row[index] if index < len(row) else None for key, index in mapped.items()}
-                for field in HEADERS.values():
-                    if not _text(values.get(field)):
-                        missing_fields[field] += 1
-                try:
-                    if missing:
-                        raise ValueError("缺少必要列")
-                    number = re.sub(r"\s+", "", _text(values["application_number"])).upper()
-                    if not number or number in seen_applications:
-                        raise ValueError("申请号为空或重复")
-                    publications = split_values(values["publication_numbers"])
-                    publication_dates = split_values(values["publication_dates"])
-                    if not publications or len(publications) != len(publication_dates):
-                        raise ValueError("公开编号与公开日期数量不一致")
-                    publication_rows = []
-                    local_publications = set()
-                    for public_number, public_date in zip(publications, publication_dates):
-                        public_number = re.sub(r"\s+", "", public_number).upper()
-                        match = re.fullmatch(r"[A-Z]{2}\d+[A-Z]\d?", public_number)
-                        if not match or public_number in seen_publications or public_number in local_publications:
-                            raise ValueError("公开编号无效或重复")
-                        local_publications.add(public_number)
-                        kind = re.search(r"([A-Z]\d?)$", public_number).group(1)
-                        publication_rows.append({"publication_number": public_number,
-                                                 "publication_date": _date(public_date).isoformat(), "kind_code": kind})
-                    if not _text(values["title"]) or not _text(values["abstract"]):
-                        raise ValueError("标题或摘要为空")
-                    priorities = _priorities(values.get("priority_numbers"), values.get("priority_dates"))
-                    application = {"application_number": number, "application_date": _date(values["application_date"]).isoformat(),
-                                   "title": _text(values["title"]), "abstract": _text(values["abstract"]),
-                                   "applicants": split_values(values.get("applicants")), "inventors": split_values(values.get("inventors")),
-                                   "ipc_codes": list(dict.fromkeys(split_values(values.get("ipc_codes")))),
-                                   "countries": split_values(values.get("countries")), "priorities": priorities,
-                                   "raw_record": raw, "source_sheet": sheet.title, "source_row": row_number,
-                                   "publications": publication_rows}
-                    applications.append(application)
-                    seen_applications.add(number)
-                    seen_publications.update(local_publications)
-                except (ValueError, TypeError, KeyError) as exc:
-                    errors.append({"sheet": sheet.title, "row": row_number, "code": "INVALID_ROW", "message": str(exc), "raw_record": raw})
-    finally:
-        workbook.close()
-    if not sheets:
-        errors.append({"code": "EMPTY_WORKBOOK", "message": "工作簿中没有有效工作表"})
-    if not applications and not errors:
-        errors.append({"code": "NO_RECORDS", "message": "工作簿中没有专利记录"})
-    quality = {"status": "failed" if errors else "ready", "application_count": len(applications),
-               "publication_count": len(seen_publications), "abstract_count": sum(bool(a["abstract"]) for a in applications),
-               "source_row_count": len(applications) + sum(e.get("code") == "INVALID_ROW" for e in errors),
-               "missing_fields": dict(missing_fields), "errors": errors, "sheets": sheets,
-               "warnings": ["当前数据为部分导出样本，统计不代表检索结果全集", "摘要为申请记录级文本，不为每个公开版本重复补造摘要",
-                            "优先权号内嵌日期逐项保留，优先权日期列可能仅列出不重复日期；多申请人和多国家字段保留全部值"],
-               "unavailable_fields": ["claims", "full_text", "legal_status", "family", "detailed_address"],
-               "publication_prefixes": dict(Counter(pub["publication_number"][:2] for a in applications for pub in a["publications"]))}
-    return {"applications": applications, "quality": quality}
+from patentcompass_core.parsing import HEADERS, REQUIRED, _date, _priorities, _text, parse_workbook, split_values
+from patentcompass_core.charts import build_chart_options
+from patentcompass_core.statistics import COUNTING_METHOD, compute_statistics
+from patentcompass_core.retrieval import (KEYWORD_EXPANSIONS, keyword_groups as _keyword_groups,
+                                        keyword_score, reciprocal_rank_fusion, text_hash as _text_hash)
 
 
 def import_dataset(ctx) -> dict:
@@ -207,17 +63,6 @@ def import_dataset(ctx) -> dict:
         raise AppError(422, "DATASET_QUALITY_FAILED", "导入数据包含异常，请查看质量说明", result)
     ctx.emit("dataset.ready", {"dataset_version_id": version_id, "application_count": result["application_count"]})
     return result
-
-
-def _keyword_groups(query: str) -> list[list[str]]:
-    groups = []
-    remainder = query.lower()
-    for term, variants in sorted(KEYWORD_EXPANSIONS.items(), key=lambda pair: -len(pair[0])):
-        if term in remainder:
-            groups.append([term, *variants])
-            remainder = remainder.replace(term, " ")
-    groups.extend([[word] for word in remainder.split() if word])
-    return groups
 
 
 def _filtered_statement(dataset_ids: list[str], filters: dict):
@@ -294,27 +139,12 @@ def search_patents(session, project: Project, filters: dict | None = None) -> di
         if mode == "hybrid":
             keyword_statement = _filtered_statement(dataset_ids, {**active_filters, "q": query})
             keyword_ids = set(session.scalars(keyword_statement.with_only_columns(PatentApplication.id)))
-            groups = _keyword_groups(query)
-            def keyword_score(patent):
-                title, abstract = patent.title.lower(), patent.abstract.lower()
-                return sum(max((3 * title.count(term) + min(abstract.count(term), 5) for term in variants), default=0)
-                           for variants in groups)
-            keyword_items = sorted((p for p in candidates if p.id in keyword_ids), key=lambda p: (-keyword_score(p), p.id))
-            # Reciprocal-rank fusion avoids comparing keyword counts with cosine scores.
-            fused = defaultdict(float)
-            for ranked in (items, keyword_items):
-                for rank, patent in enumerate(ranked[:candidate_limit], 1):
-                    fused[patent.id] += 1 / (60 + rank)
-            ordered = sorted(fused, key=lambda patent_id: (-fused[patent_id], patent_id))[:candidate_limit]
+            keyword_items = sorted((p for p in candidates if p.id in keyword_ids), key=lambda p: (-keyword_score(p, query), p.id))
+            ordered, scores = reciprocal_rank_fusion([[p.id for p in items], [p.id for p in keyword_items]], candidate_limit)
             items = [by_id[patent_id] for patent_id in ordered]
-            scores = {patent_id: fused[patent_id] for patent_id in ordered}
     else:
         items = list(session.scalars(statement.order_by(PatentApplication.application_date.desc(), PatentApplication.id)))
     return {"items": items, "scores": scores, "mode": mode, "candidate_count": len(items), "scope_application_count": total}
-
-
-def _text_hash(patent) -> str:
-    return hashlib.sha256(f"{patent.title}\n{patent.abstract}".encode()).hexdigest()
 
 
 def build_embeddings(ctx) -> dict:
@@ -349,16 +179,7 @@ def build_embeddings(ctx) -> dict:
 
 
 def _chart_option(title: str, rows: list[dict], kind: str) -> dict:
-    labels = [str(row["label"]) for row in rows]
-    values = [row["count"] for row in rows]
-    horizontal = kind != "yearly"
-    return {"animation": False, "backgroundColor": "#ffffff", "title": {"text": title, "left": "center"},
-            "tooltip": {"trigger": "axis"}, "grid": {"left": "5%", "right": "7%", "bottom": "8%", "top": "15%", "containLabel": True},
-            "xAxis": {"type": "value"} if horizontal else {"type": "category", "data": labels},
-            "yAxis": {"type": "category", "data": labels, "inverse": True,
-                      "axisLabel": {"width": 260, "overflow": "truncate"}} if horizontal else {"type": "value", "minInterval": 1},
-            "series": [{"type": "bar", "data": values, "label": {"show": True, "position": "right" if horizontal else "top"},
-                        "itemStyle": {"color": "#236b8e"}}]}
+    return build_chart_options({"title": title, "rows": rows, "kind": kind})
 
 
 def _update_analysis_context(session, ctx, analysis, expected_analysis_id=None):
@@ -394,34 +215,8 @@ def analyze(ctx) -> dict:
             patents = result["items"]
             ids = [patent.id for patent in patents]
             publications = list(session.scalars(select(PatentPublication).where(PatentPublication.application_id.in_(ids))))
-            publication_map = defaultdict(list)
-            for publication in publications:
-                publication_map[publication.application_id].append(publication.publication_number)
-            years, applicants, ipc, countries = defaultdict(list), defaultdict(list), defaultdict(list), defaultdict(list)
-            for patent in patents:
-                years[str(patent.application_date.year)].append(patent.id)
-                for name in dict.fromkeys(patent.applicants):
-                    applicants[name].append(patent.id)
-                for code in dict.fromkeys(patent.ipc_codes):
-                    ipc[code].append(patent.id)
-                for country in dict.fromkeys(patent.countries):
-                    countries[country].append(patent.id)
-            yearly = [{"year": int(year), "count": len(ids)} for year, ids in sorted(years.items())]
-            applicant_rows = [{"name": name, "count": len(ids)} for name, ids in sorted(applicants.items(), key=lambda pair: (-len(pair[1]), pair[0]))]
-            ipc_rows = [{"code": code, "count": len(ids)} for code, ids in sorted(ipc.items(), key=lambda pair: (-len(pair[1]), pair[0]))]
-            country_rows = [{"country": country, "count": len(ids)} for country, ids in
-                            sorted(countries.items(), key=lambda pair: (-len(pair[1]), pair[0]))]
             versions = list(session.scalars(select(DatasetVersion).where(DatasetVersion.id.in_(ctx.dataset_version_ids))))
-            summary = {"application_count": len(patents), "publication_count": len(publications),
-                       "abstract_count": sum(bool(p.abstract) for p in patents), "yearly": yearly, "applicants": applicant_rows,
-                       "ipc": ipc_rows, "country": country_rows, "quality": versions[0].quality if versions else {},
-                       "source_metadata": versions[0].source_metadata if versions else {}, "counting_method": COUNTING_METHOD}
-            representative = [{"application_id": p.id, "application_number": p.application_number,
-                               "publication_numbers": sorted(publication_map[p.id]), "title": p.title, "abstract": p.abstract,
-                               "source_sheet": p.source_sheet, "source_row": p.source_row, "dataset_version_id": p.dataset_version_id}
-                              for p in patents[:10]]
-            return {"summary": summary, "patent_ids": ids, "selections": {"yearly": dict(years), "applicants": dict(applicants), "ipc": dict(ipc), "country": dict(countries)},
-                    "representative": representative}
+            return compute_statistics(patents, publications, versions)
 
     calculated = ctx.step("calculate_statistics_v2_country", calculate)
     ctx.check_cancelled()

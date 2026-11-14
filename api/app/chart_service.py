@@ -1,14 +1,15 @@
 """Immutable, independently adopted chart history and snapshot-based revisions."""
 
 import copy
-import hashlib
 import json
-from collections import Counter, defaultdict
+from collections import defaultdict
 from datetime import date
 
 from sqlalchemy import func, select
 from sqlalchemy.dialects.postgresql import insert
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
+
+from patentcompass_core import charts as core_charts
 
 from app import model_provider
 from app.data_service import _chart_option, search_patents
@@ -18,7 +19,7 @@ from app.models import AnalysisResult, Chart, ChartVersion, PatentApplication, P
 
 
 def data_hash(data):
-    return hashlib.sha256(json.dumps(data, ensure_ascii=False, sort_keys=True).encode()).hexdigest()
+    return core_charts.data_hash(data)
 
 
 def ensure_versions(session, charts):
@@ -63,46 +64,11 @@ def adopt(session, chart, version_id, expected_current_version_id):
     return snapshot(session, chart)
 
 
-STYLE_ROOTS = {"title", "legend", "grid", "color", "backgroundColor", "tooltip", "xAxis", "yAxis", "series", "visualMap"}
-STYLE_KEYS = {"textStyle", "left", "right", "top", "bottom", "show", "color", "fontSize", "fontWeight",
-              "fontFamily", "position", "rotate", "width", "height", "overflow", "align", "verticalAlign",
-              "orient", "containLabel", "itemStyle", "label", "lineStyle", "areaStyle", "borderRadius",
-              "borderWidth", "borderColor", "opacity", "type", "smooth", "symbol", "symbolSize", "inverse",
-              "axisLabel", "axisLine", "axisTick", "splitLine", "trigger", "text", "subtext", "barWidth",
-              "min", "max", "calculable", "inRange", "outOfRange", "splitNumber"}
+
 
 
 def _style_patch(option, patch):
-    if not isinstance(patch, dict) or set(patch) - STYLE_ROOTS:
-        raise AppError(422, "INVALID_CHART_STYLE", "图表样式只能修改支持的呈现属性")
-
-    def merge(old, change, path):
-        if isinstance(change, dict):
-            if set(change) - STYLE_KEYS:
-                raise AppError(422, "INVALID_CHART_STYLE", "图表样式不能修改数据、映射或执行脚本")
-            result = copy.deepcopy(old) if isinstance(old, dict) else {}
-            for key, value in change.items():
-                if key == "type" and path and path[0] == "series":
-                    allowed = {"heatmap"} if isinstance(old, dict) and old.get("type") == "heatmap" else {"bar", "line", "scatter"}
-                    if value not in allowed:
-                        raise AppError(422, "INVALID_CHART_STYLE", "不支持该图表类型")
-                result[key] = merge(result.get(key), value, path + [key])
-            return result
-        if isinstance(change, list):
-            if path and path[-1] == "color" and all(isinstance(item, str) for item in change):
-                return change
-            if not isinstance(old, list) or len(change) > len(old):
-                raise AppError(422, "INVALID_CHART_STYLE", "样式修改不能增加数据系列")
-            return [merge(item, change[index], path) if index < len(change) else copy.deepcopy(item)
-                    for index, item in enumerate(old)]
-        if not isinstance(change, (str, int, float, bool, type(None))):
-            raise AppError(422, "INVALID_CHART_STYLE", "图表样式值无效")
-        return change
-
-    result = copy.deepcopy(option)
-    for key, value in patch.items():
-        result[key] = merge(result.get(key), value, [key])
-    return result
+    return core_charts.apply_chart_style(option, patch)
 
 
 DATA_FILTERS = {"q", "applicant", "ipc", "application_number", "publication_number", "application_start",
@@ -124,47 +90,9 @@ class DataFilters(BaseModel):
 
 
 def heatmap_snapshot(dimension, title, patents, assignments, theme_definitions):
-    """Compute joint cells and exact drilldown sets, never cross marginal aggregates."""
-    if dimension not in {"annual_theme", "subject_matrix"}:
-        raise AppError(422, "UNKNOWN_HEATMAP", "不支持的联合统计")
-    cells, x_counts = defaultdict(list), Counter()
-    labels = {theme["id"]: theme["label"] for theme in theme_definitions}
-    for patent in patents:
-        x_values = [str(patent.application_date.year)] if dimension == "annual_theme" else list(dict.fromkeys(patent.applicants))
-        methods = list(dict.fromkeys(assignments[patent.id]["assignment"]["methods"]))
-        for x_value in x_values:
-            x_counts[x_value] += 1
-            for theme_id in methods:
-                cells[(x_value, theme_id)].append(patent.id)
-    all_x = sorted(x_counts) if dimension == "annual_theme" else sorted(x_counts, key=lambda value: (-x_counts[value], value))
-    shown_x = all_x if dimension == "annual_theme" else all_x[:20]
-    y_counts = Counter()
-    for (_, theme_id), ids in cells.items():
-        y_counts[theme_id] += len(ids)
-    y_values = sorted(labels, key=lambda theme_id: (-y_counts[theme_id], labels[theme_id]))
-    x_indices, y_indices = {value: index for index, value in enumerate(shown_x)}, {value: index for index, value in enumerate(y_values)}
-    all_rows, selections, series = [], {}, []
-    for (x_value, theme_id), ids in sorted(cells.items()):
-        key = dimension + "-" + data_hash([x_value, theme_id])[:20]
-        row = {"value": key, "label": f"{x_value} / {labels[theme_id]}", "theme_id": theme_id, "count": len(ids),
-               **({"year": int(x_value)} if dimension == "annual_theme" else {"applicant": x_value})}
-        all_rows.append(row)
-        selections[key] = ids
-        if x_value in x_indices:
-            series.append({"name": key, "value": [x_indices[x_value], y_indices[theme_id], len(ids)]})
-    rows = [row for row in all_rows if (str(row["year"]) if dimension == "annual_theme" else row["applicant"]) in x_indices]
-    option = {"animation": False, "backgroundColor": "#ffffff", "title": {"text": title, "left": "center", "textStyle": {"fontSize": 16}},
-              "tooltip": {"position": "top"}, "grid": {"top": 60, "left": "3%", "right": "5%", "bottom": 95, "containLabel": True},
-              "xAxis": {"type": "category", "data": shown_x, "axisLabel": {"rotate": 35, "width": 120, "overflow": "truncate"}},
-              "yAxis": {"type": "category", "data": [labels[theme_id] for theme_id in y_values], "axisLabel": {"width": 140, "overflow": "truncate"}},
-              "visualMap": {"min": 0, "max": max((row["count"] for row in rows), default=1), "calculable": True,
-                            "orient": "horizontal", "left": "center", "bottom": 5, "inRange": {"color": ["#edf7f5", "#6eb7ac", "#0d7376"]}},
-              "series": [{"type": "heatmap", "data": series, "label": {"show": len(rows) < 120}, "itemStyle": {"borderColor": "#ffffff", "borderWidth": 1}}]}
-    return {"option": option, "data": {"title": title, "dimension": dimension, "rows": rows, "all_rows": all_rows,
-            "x_labels": [{"value": value, "label": value} for value in shown_x],
-            "y_labels": [{"value": theme_id, "label": labels[theme_id]} for theme_id in y_values],
-            "display_limit": None if dimension == "annual_theme" else 20, "unit": "件申请"},
-            "selections": {"dimension": dimension, "values": selections}}
+    records = [{"id": patent.id, "application_date": patent.application_date,
+                "applicants": list(patent.applicants)} for patent in patents]
+    return core_charts.heatmap_snapshot(dimension, title, records, assignments, theme_definitions)
 
 
 def _recount(session, chart, base, filters):

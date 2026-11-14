@@ -74,7 +74,8 @@ def test_all_29_business_operations_have_openapi_contracts(client):
     document = client.get("/openapi.json").json()
     operations = [(path, method, operation) for path, methods in document["paths"].items() if path.startswith("/api/")
                   for method, operation in methods.items()]
-    assert len(operations) == 44
+    assert len([item for item in operations if not item[0].startswith("/api/capabilities")]) == 44
+    assert len(operations) == 47
     for path, method, operation in operations:
         assert "responses" in operation, (method, path)
         assert "422" in operation["responses"], (method, path)

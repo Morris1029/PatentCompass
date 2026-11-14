@@ -4,6 +4,8 @@
 
 **当前阶段：前后端完整接入与样本验证。** `web/` 实现原型对应的真实工作区，连接 FastAPI 与持久化后台任务；支持样本导入、增量冲突确认、Word 资料、自然语言研究编排、全量语义分类、图表历史、报告编辑和指定版本 Word 导出。运行结果来自已保存的数据与成果；模型未配置时明确显示能力缺失，可继续使用统计分析。
 
+后端增加独立 Python 能力包 `api/patentcompass_core/`，提供解析、检索、统计、语义分类、报告和渲染能力；原前端继续使用现有接口，其他调用方可使用组件 HTTP API 或 `/mcp/`。所有底层文本生成统一调用 Responses，Embedding 仍使用独立接口。本轮不接入 Agent SDK、AgentScope 或 Skills；模型供应商的 Responses 兼容性需另行真实验证。使用方法见[组件说明](docs/capabilities.md)。
+
 ## 后端开发
 
 采用混合开发：FastAPI 在本地 Python 虚拟环境运行，PostgreSQL＋pgvector、Redis、Celery worker 在本项目独立 Docker Compose 环境运行。准备 Docker Desktop、Python 3.11 和 uv 后，在项目根目录运行：
@@ -67,6 +69,7 @@ PatentCompass/
 ├── README.md                     # 项目介绍与体验入口
 ├── 行业专利导航agent说明.md        # 完整产品方案
 ├── api/                          # FastAPI、数据库迁移与后台任务
+│   └── patentcompass_core/        # 不依赖应用、数据库或任务队列的能力包
 ├── web/                          # Next.js 真实前端与同源转发
 ├── deploy/                       # PostgreSQL、Redis 和 worker 容器
 ├── scripts/                      # 混合开发启动与 HTTP 验收
@@ -84,6 +87,7 @@ PatentCompass/
 - [专利导航设计方案](docs/plans/2026-10-10-patent-navigation-design.md)。
 - [交互界面设计草稿](docs/plans/2026-10-14-navigation-ui-draft.md)。
 - [前后端接入与真实验收](docs/plans/2026-10-19-frontend-integration.md)。
+- [独立能力、HTTP 与 MCP](docs/capabilities.md)。
 
 ## 本地验证
 

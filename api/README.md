@@ -14,7 +14,7 @@
 | Redis 7 | Docker | `127.0.0.1:16379` |
 | Celery worker | Linux Docker | 通过 Redis 接收任务，无 HTTP 端口 |
 
-Compose 工程名为 `patentcompass-dev`。数据库、Redis 使用独立命名卷；原始文件和导出文件保存在项目 `storage/`。worker 只读挂载 `api/app/` 和 `database/`，与本地 API 共享 `storage/`，不会读取 Windows 虚拟环境。
+Compose 工程名为 `patentcompass-dev`。数据库、Redis 使用独立命名卷；原始文件和导出文件保存在项目 `storage/`。worker 只读挂载 `api/app/`、`api/patentcompass_core/` 和 `database/`，与本地 API 共享 `storage/`，不会读取 Windows 虚拟环境。
 
 从项目根目录执行：
 
@@ -64,9 +64,30 @@ EMBEDDING_API_KEY=...
 EMBEDDING_MODEL=...
 ```
 
-这些地址只是格式示例；基础地址需包含提供商要求的 API 前缀，适配器分别附加 `/chat/completions` 和 `/embeddings`。默认全部留空，模型密钥不写入源码或日志。可选 `MODEL_TIMEOUT` 控制模型请求超时秒数。`LLM_EXTRA_BODY` 是可选 JSON 对象，仅向聊天模型传递提供商支持的额外参数，不能覆盖消息、工具或所配置的模型；默认 `{}`。
+这些地址只是格式示例；基础地址需包含提供商要求的 API 前缀，适配器分别附加 `/responses` 和 `/embeddings`。规划、问答、语义抽取与归并、摘要、图表解读和改写均走 Responses，不回退到 Chat Completions。供应商须实际支持 Responses、工具往返和所用流式事件；仅支持 Chat Completions 的地址不能直接使用。
+
+默认配置留空，模型密钥不写入源码或日志。可选 `MODEL_TIMEOUT` 控制模型请求超时秒数。`LLM_EXTRA_BODY` 是可选 JSON 对象，仅传递提供商支持的额外参数，不能覆盖模型、输入、工具、流式和续接等受控字段；默认 `{}`。后端使用 `store=false` 并自行保存必要的输出项及工具结果；模型的拒绝、不完整或失败响应不会当作成功回答保存。配置项名称沿用原接口约定，不新增对外 Responses 聊天入口。
 
 `EMBEDDING_BATCH_SIZE` 控制每次向量请求的文本数量，默认 10。应按模型服务的批次上限设置；模型或批次大小变化时使用不同检查点，已存在的相同模型向量仍复用。修改模型配置后需同时重启本地 API，并重新创建 worker 容器读取 `.env`。
+
+## 独立能力与接入入口
+
+`patentcompass_core/` 接收普通记录、快照和显式模型配置，不导入 `app`、FastAPI、SQLAlchemy 或 Celery。可直接调用解析、检索和统计等能力；需要模型、Word 转换或渲染时，由调用方提供对应配置和运行依赖。从项目根目录运行不调用模型的示例：
+
+```powershell
+uv run --project api --frozen python examples/capabilities.py
+```
+
+原有项目、对话、任务、报告和文件接口保留。新增组件入口与 MCP 共用同一应用服务：
+
+| 入口 | 用途 |
+| --- | --- |
+| `GET /api/capabilities` | 能力目录、参数结构及同步/任务执行方式 |
+| `POST /api/capabilities/{name}/invoke` | 用明确记录或数据版本调用能力 |
+| `POST /api/capabilities/files` | 上传解析所需文件并取得受控文件引用 |
+| `/mcp/` | Streamable HTTP MCP，工具参数和能力实现与 HTTP 共用 |
+
+异步 HTTP 调用需要 `Idempotency-Key`，返回 `202` 与 `run_id/status`；MCP 异步工具使用 `request` 加 `idempotency_key` 参数。任务状态、事件、取消和重试复用现有运行记录。独立报告构建和改写只产生内容，不自动发布或采用项目报告版本。完整输入、输出、示例和边界见[组件说明](../docs/capabilities.md)。本轮不新增 Skills 或 Agent 框架。
 
 ## 接口与最小使用流程
 
@@ -74,7 +95,7 @@ EMBEDDING_MODEL=...
 
 以下为设计中的 29 个业务操作；健康检查和文档路由另外提供。长任务返回 `202` 和 `run_id`，结果通过运行接口读取。
 
-完整前端另有资料、图表修订和研究版本等增量操作。当前共 44 项业务操作，具体字段以 OpenAPI 为准。
+完整前端另有资料、图表修订和研究版本等增量操作。原有 44 项业务操作保留，另增加组件目录、调用和文件上传入口；具体字段以 OpenAPI 为准。
 
 | 方法与路径 | 用途 |
 | --- | --- |
@@ -143,7 +164,7 @@ EMBEDDING_MODEL=...
 
 运行状态包括 `queued`、`running`、`waiting_input`、`succeeded`、`failed`、`cancelling`、`cancelled`。SSE 断开不取消任务；数据库保存事件和步骤。API 运行时定期补偿派发，并在 worker 租约过期后恢复任务，因此处理新任务和故障恢复时需保持 API 与 worker 均运行。
 
-对话模型通过只读检索工具定位冻结范围内的原文，再生成回答并保存引用；每次消息分别固定发送时的上下文，历史报告追问沿用该报告的数据与范围。SSE 支持 `message.delta` 和 `message.completed`；当前模型适配器先取得完整回答，再将已保存正文分段发送，不代表供应商端逐 token 流式输出。
+对话模型通过只读检索工具定位冻结范围内的原文，再生成回答并保存引用；每次消息分别固定发送时的上下文，历史报告追问沿用该报告的数据与范围。供应商 Responses 的文本增量经数据库事件转发为 `message.delta`，最终完成后保存回答并发出 `message.completed`；工具轮次的过渡文字可能通过 `message.reset` 清除。前端 SSE 事件契约保留，断线后按事件序号补读。
 
 范围、数据绑定和报告当前版本更新分别携带 `expected_scope_version_id`、`expected_revision`、`expected_current_version_id`；过期更新返回 `409`。报告路径中的 `{version}` 使用版本 UUID，不是数字序号。结构化修改指定 `base_version_id`、`expected_current_version_id`、`block_id` 与 `replacement_text`；自然语言修改用 `instruction` 替换 `replacement_text`，两者只能提供一项。需要可靠重试写入时携带 `Idempotency-Key`，相同键与相同请求复用原结果，避免重复提交任务。分页使用接口返回的 `next_cursor`，不自行拼接游标。SSE 使用 `after` 查询参数或 `Last-Event-ID` 请求头续读。
 

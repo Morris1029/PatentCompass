@@ -1,4 +1,4 @@
-"""Accept real configured models through PatentCompass HTTP APIs; never read keys.
+"""Accept real configured models through PatentCompass HTTP APIs; never record keys.
 
 Run with api/.venv/Scripts/python.exe scripts/model-smoke-test.py. Existing ready
 520-record sample data is reused; an independent project and artifacts are kept.
@@ -12,6 +12,8 @@ from pathlib import Path
 import sys
 import time
 from uuid import uuid4
+from unittest.mock import patch
+from urllib.parse import urlsplit
 from zipfile import ZipFile
 
 from docx import Document
@@ -19,6 +21,7 @@ import httpx
 
 
 ROOT = Path(__file__).resolve().parents[1]
+SUITE_VERSION = "responses-v2"
 
 
 def check(condition, message):
@@ -26,15 +29,79 @@ def check(condition, message):
         raise RuntimeError(message)
 
 
+def confirmation_input(state, policy):
+    """Confirm only the fixed read-only scope declared by this acceptance case."""
+    question = state.get("input_request") or {}
+    check(policy is not None and question.get("kind") == "execution_confirmation",
+          f"Unexpected confirmation retained for inspection: {question}")
+    check(state["scope_version_id"] == policy["scope_version_id"] and question.get("scope") == policy["scope"],
+          "Confirmation changed the fixed acceptance scope")
+    check(sorted(state["dataset_version_ids"]) == sorted(policy["dataset_version_ids"]),
+          "Confirmation changed the fixed acceptance data")
+    actions = {item["kind"] for item in question.get("actions", [])}
+    check(actions and actions <= set(policy["actions"]), "Confirmation requested an operation outside this acceptance case")
+    check(not question.get("research_assignment"), "Read-only acceptance must not select a research assignment")
+    return {"input_request_id": question["id"], "expected_scope_version_id": policy["scope_version_id"],
+            "values": {"confirmed": True}}
+
+
+def immutable_revision(value):
+    return {key: value.get(key) for key in ("id", "report_id", "research_id", "number", "parent_id", "content",
+        "analysis_id", "scope_version_id", "dataset_version_ids", "chart_ids", "created_at", "change_kind", "restored_from_id")}
+
+
+def verify_responses_roundtrip(request, project_id, gateway):
+    """Check real Responses wire semantics separately from HTTP product behavior."""
+    wire, original_post = [], httpx.post
+
+    def record_post(url, **kwargs):
+        payload = kwargs["json"]
+        response = original_post(url, **kwargs)
+        entry = {"path": urlsplit(url).path, "input_types": [item.get("type", "message") for item in payload["input"]],
+                 "function_output_call_ids": [item["call_id"] for item in payload["input"] if item.get("type") == "function_call_output"]}
+        if response.is_success:
+            entry["output_types"] = [item["type"] for item in response.json().get("output", [])]
+        wire.append(entry)
+        return response
+
+    tools = [{"type": "function", "function": {"name": "search_patents", "description": "检索当前验收项目的专利样本。",
+        "parameters": {"type": "object", "properties": {"q": {"type": "string", "enum": ["drone"]}},
+                       "required": ["q"], "additionalProperties": False}}}]
+    messages = [{"role": "user", "content": "必须先调用一次 search_patents，以 q=drone 检索。取得工具结果后用中文概括，并引用返回的一项申请号；不能自行编造结果。"}]
+    with patch.object(httpx, "post", record_post):
+        first = gateway.chat(messages, tools)
+        calls = first.get("tool_calls", [])
+        check(first.get("_generation_protocol") == "responses-v1" and len(calls) == 1,
+              "Responses did not return exactly one complete function call")
+        call = calls[0]
+        check(call["function"]["name"] == "search_patents" and json.loads(call["function"]["arguments"]) == {"q": "drone"},
+              "Responses requested an unexpected tool or query")
+        page = request("GET", f"/api/projects/{project_id}/patents", params={"q": "drone", "mode": "keywords", "limit": 3})
+        records = [{key: row[key] for key in ("id", "application_number", "title", "abstract")} for row in page["items"]]
+        check(records, "Fixed Responses tool query returned no patent evidence")
+        final = gateway.chat([*messages, first, {"role": "tool", "tool_call_id": call["id"],
+            "content": json.dumps({"records": records, "matched_count": page["total"]}, ensure_ascii=False)}])
+    check(len(wire) == 2 and all(item["path"].endswith("/responses") for item in wire), "Generation used a non-Responses route")
+    check("function_call" in wire[0]["output_types"] and "function_call" in wire[1]["input_types"]
+          and wire[1]["function_output_call_ids"] == [call["id"]], "Responses tool continuation lost its call_id or original output")
+    check(final.get("_generation_protocol") == "responses-v1" and not final.get("tool_calls") and final.get("content"),
+          "Responses did not complete after receiving the function result")
+    check(any(row["application_number"] in final["content"] for row in records), "Responses final answer omitted actual tool evidence")
+    return {"protocol": "responses-v1", "wire": wire, "call_id": call["id"],
+            "retrieved_ids": [row["id"] for row in records], "answer": final["content"],
+            "usage": {"tool_call": first.get("usage"), "answer": final.get("usage")}}
+
+
 def run(args):
     identity = "models-" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid4().hex[:8]
     output = args.output_root.resolve() / identity
     output.mkdir(parents=True)
     result = {"acceptance_id": identity, "base_url": args.base_url, "status": "running",
-              "started_at": datetime.now(timezone.utc).isoformat(), "stages": {}, "runs": {}}
+              "started_at": datetime.now(timezone.utc).isoformat(), "suite_version": SUITE_VERSION, "stages": {}, "runs": {}}
     if args.resume:
         previous_path = args.resume.resolve()
         previous = json.loads(previous_path.read_text(encoding="utf-8"))
+        check(previous.get("suite_version") == SUITE_VERSION, "Resume requires a result from this Responses acceptance suite; start a new run for older results")
         check(previous["base_url"].rstrip("/") == args.base_url.rstrip("/"), "Resume must use the same backend URL")
         check(previous.get("project_id"), "Resume requires a previously created acceptance project")
         result = {**previous, "acceptance_id": identity, "status": "running", "started_at": datetime.now(timezone.utc).isoformat(),
@@ -78,9 +145,10 @@ def run(args):
                   f"{method} {path}: expected {expected_status}, received {response.status_code}: {response.text[:1200]}")
             return response.json()
 
-        def wait_run(run_id, name):
+        def wait_run(run_id, name, confirmation=None):
             deadline = time.monotonic() + args.timeout
             last_status, last_progress = None, 0
+            confirmed = set()
             while time.monotonic() < deadline:
                 value = request("GET", f"/api/runs/{run_id}")
                 result["runs"][name] = value
@@ -90,7 +158,15 @@ def run(args):
                     print(f"{name}: {value['status']}, {completed} completed steps", flush=True)
                     last_status, last_progress = progress, time.monotonic()
                     save()
-                if value["status"] in {"succeeded", "failed", "cancelled", "waiting_input"}:
+                if value["status"] == "waiting_input":
+                    body = confirmation_input(value, confirmation)
+                    check(body["input_request_id"] not in confirmed, "The same confirmation remained pending after submission")
+                    confirmed.add(body["input_request_id"])
+                    result.setdefault("confirmations", []).append({"run_id": run_id, "name": name, "input": body})
+                    save()
+                    request("POST", f"/api/runs/{run_id}/inputs", expected_status=202, json=body)
+                    continue
+                if value["status"] in {"succeeded", "failed", "cancelled"}:
                     check(value["status"] == "succeeded", f"{name}: {value['status']}: {value.get('error') or value.get('input_request')}")
                     return value
                 time.sleep(1)
@@ -126,7 +202,10 @@ def run(args):
             resumed_ids = [int(line[4:]) for line in resumed.text.splitlines() if line.startswith("id: ")]
             check(resumed_ids == [value for value in ids if value > cursor], f"{name}: SSE continuation duplicated or omitted events")
             (output / f"{name}-events.json").write_text(json.dumps(events, ensure_ascii=False, indent=2), encoding="utf-8")
-            return {"event_count": len(events), "resumed_after": cursor, "resumed_count": len(resumed_ids)}
+            evidence_ids = sorted({record["id"] for event in events if event["event"] == "evidence.ready"
+                                   for record in event["data"].get("payload", {}).get("records", [])})
+            return {"event_count": len(events), "resumed_after": cursor, "resumed_count": len(resumed_ids),
+                    "evidence_record_ids": evidence_ids}
 
         def prepare():
             readiness = request("GET", "/health/ready")
@@ -162,6 +241,18 @@ def run(args):
 
         stage("prepare", prepare)
 
+        def responses_roundtrip():
+            sys.path.insert(0, str(ROOT / "api"))
+            from app.config import Settings
+            from patentcompass_core.generation import GenerationConfig, ResponsesGateway
+            settings = Settings(_env_file=ROOT / "api" / ".env")
+            gateway = ResponsesGateway(GenerationConfig(settings.llm_base_url, settings.llm_api_key, settings.llm_model,
+                settings.model_timeout, settings.llm_extra_body))
+            return {**verify_responses_roundtrip(request, result["project_id"], gateway),
+                    "configuration": "Local api/.env and environment; HTTP product execution is checked separately"}
+
+        stage("responses_tool_roundtrip", responses_roundtrip, ("prepare",))
+
         def index():
             value = start_run("index", "embedding_index")
             check(value["result"]["indexed_count"] == 520, "Index did not cover all 520 application records")
@@ -190,28 +281,32 @@ def run(args):
         stage("semantic_and_hybrid_search", search, ("embedding_index",))
 
         def conversation():
+            project = request("GET", f"/api/projects/{result['project_id']}")
             task = request("POST", f"/api/projects/{result['project_id']}/conversations", expected_status=202,
                 json={"initial_message": {"content": "请调用 search_patents 工具，使用简短检索词 drone 查询本项目样本，依据实际返回记录用中文总结三项无人机技术内容，必须引用至少一个返回的申请编号，不能编造记录。"}})
             result["conversation_id"] = task["conversation_id"]
-            value = wait_run(task["run_id"], "chat")
-            steps = [step for step in value["steps"] if step["key"].startswith("chat_search_")]
-            check(steps and all(step["status"] == "succeeded" for step in steps), "Model did not actually invoke search_patents")
+            value = wait_run(task["run_id"], "chat", {"actions": ["search_patents"], "scope": project["scope"]["content"],
+                "scope_version_id": project["scope_version_id"], "dataset_version_ids": [result["dataset"]["dataset_version_id"]]})
+            activities = [item for item in value.get("activities", []) if item["kind"] == "search_patents"]
+            check(activities and all(item["status"] == "succeeded" for item in activities), "Model did not complete the patent search activity")
             messages = request("GET", f"/api/conversations/{task['conversation_id']}/messages")["items"]
             answer = next(item for item in messages if item["id"] == value["result"]["message_id"])
             citations = (answer.get("reference") or {}).get("citations", [])
             check(answer["role"] == "assistant" and citations, "Assistant answer or persisted original-record citations missing")
             check(any(citation["application_number"] in answer["content"] for citation in citations), "Answer does not cite a returned application number")
-            retrieved_ids = {record["id"] for step in steps for record in step["result"]["records"]}
+            events = verify_events(value["id"], "chat", ["activity.updated", "evidence.ready", "message.delta", "message.completed", "run.completed"])
+            retrieved_ids = set(events["evidence_record_ids"])
             check({citation["id"] for citation in citations} <= retrieved_ids, "Saved citations differ from actual tool results")
             result["chat_messages"] = messages
             check(request("GET", f"/api/conversations/{task['conversation_id']}/messages")["items"] == messages, "Message refresh changed history")
-            return {"answer": answer, "search_step_count": len(steps), "sse": verify_events(value["id"], "chat", ["evidence.ready", "message.delta", "message.completed", "run.completed"])}
+            return {"answer": answer, "search_activities": activities, "sse": events}
 
         stage("tool_chat", conversation, ("prepare",))
 
         def generate():
             value = start_run("generate_report", "ai_report", report_mode="ai")
-            check(any(step["key"] == "report_synthesis" and step["status"] == "succeeded" for step in value["steps"]), "Report skipped real model synthesis")
+            check(any(item["kind"] == "generate_report" and item["status"] == "succeeded" for item in value.get("activities", [])),
+                  "Report generation activity did not complete")
             result["report_id"] = value["result"]["report_id"]
             version = request("GET", f"/api/reports/{result['report_id']}/versions/{value['result']['report_version_id']}")
             generated = [block for block in version["content"]["blocks"] if block.get("origin") == "model"]
@@ -228,12 +323,15 @@ def run(args):
                 "base_version_id": v1["id"], "expected_current_version_id": v1["id"], "block_id": result["model_block_id"],
                 "instruction": "请把这段改写成两到三句中文，开头写“样本观察：”，突出这是部分检索结果，保留原文中已有的数据边界和证据，不新增技术结论或法律判断。"})
             value = wait_run(task["run_id"], "natural_language_revision")
-            check(any(step["key"] == "revision_text" and step["status"] == "succeeded" for step in value["steps"]), "Natural-language revision skipped model")
+            check(any(item["kind"] == "revise_report" and item["status"] == "succeeded" for item in value.get("activities", [])),
+                  "Natural-language revision activity did not complete")
             version = request("GET", f"/api/reports/{result['report_id']}/versions/{value['result']['report_version_id']}")
             old = next(block for block in v1["content"]["blocks"] if block["id"] == result["model_block_id"])
             new = next(block for block in version["content"]["blocks"] if block["id"] == result["model_block_id"])
-            check(version["number"] == 2 and version["parent_id"] == v1["id"] and new["text"] != old["text"], "Revision did not create changed version 2")
-            check(request("GET", f"/api/reports/{result['report_id']}/versions/{v1['id']}") == v1, "AI revision overwrote immutable version 1")
+            check(version["number"] == v1["number"] + 1 and version["parent_id"] == v1["id"] and new["text"] != old["text"], "Revision did not append changed content")
+            check(new["text"].startswith("样本观察："), "Natural-language revision did not follow the fixed writing instruction")
+            check(version["research_id"] == v1["research_id"] and version["research_number"] == v1["research_number"], "A text edit unexpectedly created a new research round")
+            check(immutable_revision(request("GET", f"/api/reports/{result['report_id']}/versions/{v1['id']}")) == immutable_revision(v1), "AI revision overwrote the initial immutable content")
             result["v2"] = version
             return {"version_id": version["id"], "old_text": old["text"], "new_text": new["text"]}
 
@@ -255,13 +353,15 @@ def run(args):
             else:
                 task = request("POST", f"/api/projects/{project['id']}/conversations", expected_status=202, json={"initial_message": body})
                 conversation_id = task["conversation_id"]
-            value = wait_run(task["run_id"], "historical_v1_question")
+            value = wait_run(task["run_id"], "historical_v1_question", {"actions": ["search_patents", "search_materials"],
+                "scope": v1["content"]["source"]["scope"], "scope_version_id": v1["scope_version_id"],
+                "dataset_version_ids": v1["dataset_version_ids"]})
             check(value["scope_version_id"] == v1["scope_version_id"] != scope["id"], "Historical question used current scope")
             messages = request("GET", f"/api/conversations/{conversation_id}/messages")["items"]
             answer = next(item for item in messages if item["id"] == value["result"]["message_id"])
             check(answer["reference"]["report_version_id"] == v1["id"] and "520" in answer["content"] and "526" in answer["content"],
                   "Historical answer did not retain V1 sample counts")
-            check(request("GET", f"/api/reports/{result['report_id']}/versions/{v1['id']}") == v1, "Historical question changed version 1")
+            check(immutable_revision(request("GET", f"/api/reports/{result['report_id']}/versions/{v1['id']}")) == immutable_revision(v1), "Historical question changed the initial report content")
             return {"current_scope_count": current["total"], "current_scope_version_id": scope["id"], "answer": answer,
                     "sse": verify_events(value["id"], "historical-v1", ["message.delta", "message.completed", "run.completed"])}
 

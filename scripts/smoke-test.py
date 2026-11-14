@@ -18,11 +18,30 @@ import openpyxl
 
 
 ROOT = Path(__file__).resolve().parents[1]
+REQUIRED_OPERATIONS = {
+    ("post", "/api/projects"), ("get", "/api/projects"), ("get", "/api/projects/{id}"),
+    ("patch", "/api/projects/{id}/scope"), ("get", "/api/datasets"), ("post", "/api/datasets/imports"),
+    ("get", "/api/datasets/{id}/quality"), ("put", "/api/projects/{id}/datasets"),
+    ("get", "/api/projects/{id}/patents"), ("get", "/api/projects/{id}/patents/{patent_id}"),
+    ("post", "/api/projects/{id}/conversations"), ("get", "/api/projects/{id}/conversations"),
+    ("get", "/api/conversations/{id}/messages"), ("post", "/api/conversations/{id}/messages"),
+    ("post", "/api/projects/{id}/runs"), ("get", "/api/runs/{id}"), ("get", "/api/runs/{id}/events"),
+    ("post", "/api/runs/{id}/inputs"), ("post", "/api/runs/{id}/cancel"), ("post", "/api/runs/{id}/retry"),
+    ("get", "/api/projects/{id}/analysis"), ("get", "/api/charts/{id}"), ("get", "/api/evidence/{id}"),
+    ("get", "/api/reports/{id}/versions"), ("get", "/api/reports/{id}/versions/{version}"),
+    ("post", "/api/reports/{id}/revisions"), ("put", "/api/reports/{id}/current-version"),
+    ("post", "/api/reports/{id}/exports"), ("get", "/api/files/{id}"),
+}
 
 
 def check(condition, message):
     if not condition:
         raise RuntimeError(message)
+
+
+def immutable_revision(value):
+    return {key: value.get(key) for key in ("id", "report_id", "research_id", "number", "parent_id", "content",
+        "analysis_id", "scope_version_id", "dataset_version_ids", "chart_ids", "created_at", "change_kind", "restored_from_id")}
 
 
 def reference_statistics(path):
@@ -86,6 +105,7 @@ def run(args):
                 result = request("GET", f"/api/runs/{run_id}")
                 if waiting and result["status"] == "waiting_input":
                     return result
+                check(result["status"] != "waiting_input", f"Unexpected input request retained for inspection: {result.get('input_request')}")
                 if result["status"] in {"succeeded", "failed", "cancelled"}:
                     check(result["status"] == "succeeded", f"Run {run_id} failed: {result.get('error')}")
                     return result
@@ -97,10 +117,11 @@ def run(args):
             check(readiness["status"] == "ready", "Dependencies are not ready")
             summary["readiness"] = readiness
             openapi = request("GET", "/openapi.json")
-            business_operations = sum(method in {"get", "post", "put", "patch", "delete"}
-                                      for path, methods in openapi["paths"].items() if path.startswith("/api/") for method in methods)
-            check(business_operations == 29, f"Expected 29 business operations, got {business_operations}")
-            note("Readiness and 29 business operations verified")
+            operations = {(method, path) for path, methods in openapi["paths"].items() if path.startswith("/api/")
+                          for method in methods if method in {"get", "post", "put", "patch", "delete"}}
+            check(REQUIRED_OPERATIONS <= operations, f"Missing backward-compatible operations: {sorted(REQUIRED_OPERATIONS - operations)}")
+            summary["business_operation_count"] = len(operations)
+            note(f"Readiness and all 29 original operation contracts verified; {len(operations)} operations available")
 
             project_body = {"name": f"无人机样本接口验收 {identity}",
                             "scope": {"industry": "无人机", "source_region": "中国", "coverage": "部分检索结果"}}
@@ -135,9 +156,15 @@ def run(args):
             analyzing = request("POST", f"/api/projects/{project_id}/runs", expected_status=202, json={"action": "analyze"})
             pending = wait_run(analyzing["run_id"], waiting=True)
             check(pending["status"] == "waiting_input", "Unconfirmed scope should require input")
+            check(pending["input_request"]["kind"] == "scope_confirmation"
+                  and pending["input_request"]["scope"] == project_body["scope"]
+                  and pending["scope_version_id"] == project["scope_version_id"]
+                  and pending["dataset_version_ids"] == [imported["dataset_version_id"]],
+                  "Initial confirmation differs from the explicitly prepared acceptance scope or data")
             request("POST", f"/api/runs/{analyzing['run_id']}/inputs", expected_status=202,
                     json={"input_request_id": pending["input_request"]["id"],
-                          "expected_scope_version_id": pending["scope_version_id"], "values": {"confirmed": True}})
+                          "expected_scope_version_id": pending["scope_version_id"],
+                          "values": {"confirmed": True, "scope": project_body["scope"]}})
             analyzed = summary["runs"]["analyze"] = wait_run(analyzing["run_id"])
             analysis = request("GET", f"/api/projects/{project_id}/analysis", params={"run_id": analyzed["id"]})
             for key, value in expected.items():
@@ -155,23 +182,25 @@ def run(args):
                     break
             check(len(patents) == len({item["id"] for item in patents}) == 520, "Patent pagination omitted or repeated records")
             chart_records = []
+            expected_chart_kinds = {"yearly", "applicants", "ipc", "country"}
             for chart_id in analyzed["result"]["chart_ids"]:
                 chart = request("GET", f"/api/charts/{chart_id}")
                 check(chart["provenance"]["dataset_version_ids"] == [imported["dataset_version_id"]], "Chart dataset snapshot differs")
                 check(len(chart["provenance"]["application_ids"]) == 520, "Chart omitted source applications")
-                dimension = chart["data"]["rows"][0]["value"]
-                down = request("GET", f"/api/projects/{project_id}/patents", params={"chart_id": chart_id,
-                    "chart_version_id": chart["version_id"], "dimension_value": dimension, "limit": 200})
-                check(down["total"] == chart["data"]["rows"][0]["count"], "Chart drilldown differs from saved count")
+                if chart["data"]["rows"]:
+                    dimension = chart["data"]["rows"][0]["value"]
+                    down = request("GET", f"/api/projects/{project_id}/patents", params={"chart_id": chart_id,
+                        "chart_version_id": chart["version_id"], "dimension_value": dimension, "limit": 200})
+                    check(down["total"] == chart["data"]["rows"][0]["count"], "Chart drilldown differs from saved count")
                 chart_records.append(chart)
-            check(len(chart_records) == 3, "Expected annual, applicant and IPC charts")
+            check({chart["kind"] for chart in chart_records} == expected_chart_kinds, "Expected annual, applicant, IPC and source-country charts")
             evidence = [request("GET", f"/api/evidence/{evidence_id}") for evidence_id in analyzed["result"]["evidence_ids"]]
             check(any(item["kind"] == "patent" and item["content"]["abstract"] for item in evidence), "Original abstract evidence missing")
-            check(sum(item["kind"] == "statistic" for item in evidence) == 3, "Statistical evidence missing")
+            check(sum(item["kind"] == "statistic" for item in evidence) == len(expected_chart_kinds), "Statistical evidence missing")
             summary["charts"], summary["evidence"] = chart_records, evidence
             events = client.get(f"/api/runs/{analyzed['id']}/events")
             check(events.status_code == 200 and "event: run.completed" in events.text, "Persisted SSE replay is incomplete")
-            note("Patent pagination, three charts, snapshot drilldown, original evidence and SSE replay verified")
+            note("Patent pagination, four analysis charts, snapshot drilldown, original evidence and SSE replay verified")
 
             generated = request("POST", f"/api/projects/{project_id}/runs", expected_status=202,
                                 json={"action": "generate_report", "analysis_id": analyzed["result"]["analysis_id"], "report_mode": "statistical"})
@@ -188,20 +217,30 @@ def run(args):
                 completed = summary["runs"][label] = wait_run(task["run_id"])
                 return request("GET", f"/api/reports/{report_id}/versions/{completed['result']['report_version_id']}")
 
-            marker_v2, marker_v3 = " HTTP_ACCEPTANCE_V2", " HTTP_ACCEPTANCE_V3"
+            marker_v2, marker_v3 = " HTTP_ACCEPTANCE_EDIT_2", " HTTP_ACCEPTANCE_AFTER_RESTORE"
             v2 = revise(v1, marker_v2, "revision_v2")
             check(v2["number"] == 2 and v2["parent_id"] == v1["id"], "Version 2 lineage is wrong")
-            request("PUT", f"/api/reports/{report_id}/current-version", json={"version_id": v1["id"], "expected_current_version_id": v2["id"]})
-            v3 = revise(v1, marker_v3, "revision_v3")
-            check(v3["number"] == 3 and v3["parent_id"] == v1["id"], "Branch revision did not preserve parent version 1")
-            check(request("GET", f"/api/reports/{report_id}/versions/{v1['id']}") == v1, "Original version 1 was overwritten")
-            check(request("GET", f"/api/reports/{report_id}/versions/{v2['id']}") == v2, "Version 2 branch was overwritten")
+            research_id = v1["research_id"]
+            restoring = request("POST", f"/api/research-versions/{research_id}/restore", expected_status=202, json={
+                "revision_id": v1["id"], "expected_current_version_id": v2["id"], "expected_adopted_version_id": v2["id"]})
+            restored_run = summary["runs"]["restore_v1"] = wait_run(restoring["run_id"])
+            restored = request("GET", f"/api/reports/{report_id}/versions/{restored_run['result']['report_version_id']}")
+            check(restored["number"] == 3 and restored["parent_id"] == v2["id"] and restored["restored_from_id"] == v1["id"]
+                  and restored["content"] == v1["content"], "Historical restore did not append the expected immutable revision")
+            v3 = revise(restored, marker_v3, "revision_v3")
+            check(v3["number"] == 4 and v3["parent_id"] == restored["id"], "Editing restored content did not preserve its revision parent")
+            check(immutable_revision(request("GET", f"/api/reports/{report_id}/versions/{v1['id']}")) == immutable_revision(v1), "Original revision was overwritten")
+            check(immutable_revision(request("GET", f"/api/reports/{report_id}/versions/{v2['id']}")) == immutable_revision(v2), "Earlier edit was overwritten")
             versions = request("GET", f"/api/reports/{report_id}/versions")
-            check({item["number"] for item in versions["items"]} == {1, 2, 3}, "Report version history is incomplete")
+            check({item["number"] for item in versions["items"]} == {1, 2, 3, 4}, "Report revision history is incomplete")
+            check(all(item["research_id"] == research_id and item["research_number"] == v1["research_number"]
+                      for item in versions["items"]), "Report edits or restore unexpectedly created a research round")
+            researches = request("GET", f"/api/reports/{report_id}/research-versions")
+            check([item["id"] for item in researches["items"]] == [research_id], "Expected exactly one published research round")
             project = request("GET", f"/api/projects/{project_id}")
-            check(project["current_report_version_id"] == v3["id"], "Current adopted version is not version 3")
-            summary["versions"] = {"v1": v1, "v2": v2, "v3": v3}
-            note("Report V1 -> V2 -> adopt V1 -> V3 verified; original and sibling branch remain immutable")
+            check(project["current_report_version_id"] == v3["id"], "Current adopted content is not the latest edit after restore")
+            summary["versions"] = {"v1": v1, "v2": v2, "restored": restored, "v3": v3}
+            note("Report initial content -> edit -> restore initial content -> edit verified as four immutable revisions in one research round")
 
             task = request("POST", f"/api/reports/{report_id}/exports", expected_status=202,
                            json={"report_version_id": v1["id"], "format": "docx"})

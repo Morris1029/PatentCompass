@@ -4,9 +4,13 @@
 !api/uv.lock
 !api/app/
 !api/app/**
+!api/patentcompass_core/
+!api/patentcompass_core/**
 !api/chart-renderer/
 !api/chart-renderer/package.json
 !api/chart-renderer/package-lock.json
 !api/chart-renderer/render.mjs
 api/app/**/__pycache__/
 api/app/**/*.pyc
+api/patentcompass_core/**/__pycache__/
+api/patentcompass_core/**/*.pyc

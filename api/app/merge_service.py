@@ -2,98 +2,18 @@
 
 import copy
 import hashlib
-import re
 from collections import Counter
 from datetime import date, datetime
-from pathlib import Path
 
-import openpyxl
 from sqlalchemy import func, select
 
-from app.data_service import HEADERS, _date, _priorities, _text, split_values
+from patentcompass_core.parsing import APPLICATION_FIELDS, LIST_FIELDS, _date, parse_supplement
 from app.db import session_scope
 from app.errors import AppError
 from app.files import resolve_file
 from app.jobs import WaitingForInput, emit_event
 from app.models import (DatasetSource, DatasetVersion, ImportConflict, PatentApplication,
                         PatentPublication, StoredFile, new_id)
-
-LIST_FIELDS = {"applicants", "inventors", "ipc_codes", "countries", "priorities"}
-APPLICATION_FIELDS = ("application_date", "title", "abstract", "applicants", "inventors",
-                      "ipc_codes", "countries", "priorities")
-
-
-def parse_supplement(path: str | Path, existing_numbers: set[str]) -> dict:
-    """Partial rows are allowed only for existing original application numbers."""
-    rows, errors, sheets, seen = [], [], [], set()
-    try:
-        workbook = openpyxl.load_workbook(path, read_only=True, data_only=True)
-    except Exception as exc:
-        raise AppError(422, "INVALID_WORKBOOK", "无法读取 Excel 文件") from exc
-    try:
-        for sheet in workbook:
-            iterator = sheet.iter_rows(values_only=True)
-            header = [_text(item) for item in next(iterator, [])]
-            if not any(header):
-                continue
-            mapped = {HEADERS[name]: index for index, name in enumerate(header) if name in HEADERS}
-            sheets.append({"name": sheet.title, "headers": header})
-            if "application_number" not in mapped:
-                errors.append({"sheet": sheet.title, "row": 1, "message": "补充文件必须包含申请号列"})
-                continue
-            for row_number, row in enumerate(iterator, 2):
-                if not any(_text(value) for value in row):
-                    continue
-                raw = {header[index] or f"column_{index + 1}":
-                       value.isoformat() if isinstance(value, (date, datetime)) else value
-                       for index, value in enumerate(row) if index < len(header)}
-                values = {key: row[index] if index < len(row) else None for key, index in mapped.items()}
-                try:
-                    number = re.sub(r"\s+", "", _text(values["application_number"])).upper()
-                    if not number or number in seen:
-                        raise ValueError("申请号为空或重复")
-                    fields = {}
-                    for name in ("title", "abstract"):
-                        if _text(values.get(name)):
-                            fields[name] = _text(values[name])
-                    if _text(values.get("application_date")):
-                        fields["application_date"] = _date(values["application_date"]).isoformat()
-                    for name in LIST_FIELDS - {"priorities"}:
-                        if _text(values.get(name)):
-                            fields[name] = list(dict.fromkeys(split_values(values[name])))
-                    if _text(values.get("priority_dates")) and not _text(values.get("priority_numbers")):
-                        raise ValueError("补充优先权日期时必须同时提供优先权号")
-                    if _text(values.get("priority_numbers")):
-                        fields["priorities"] = _priorities(values.get("priority_numbers"), values.get("priority_dates"))
-                    numbers = split_values(values.get("publication_numbers"))
-                    dates = split_values(values.get("publication_dates"))
-                    if dates and len(dates) != len(numbers):
-                        raise ValueError("公开编号与公开日期数量不一致")
-                    publications, public_seen = [], set()
-                    for index, public_number in enumerate(numbers):
-                        public_number = re.sub(r"\s+", "", public_number).upper()
-                        if not re.fullmatch(r"[A-Z]{2}\d+[A-Z]\d?", public_number) or public_number in public_seen:
-                            raise ValueError("公开编号无效或重复")
-                        public_seen.add(public_number)
-                        publications.append({"publication_number": public_number,
-                                             "publication_date": _date(dates[index]).isoformat() if dates else None,
-                                             "kind_code": re.search(r"([A-Z]\d?)$", public_number).group(1)})
-                    if number not in existing_numbers:
-                        if not all(fields.get(name) for name in ("application_date", "title", "abstract")):
-                            raise ValueError("新增申请必须提供申请日、标题和摘要")
-                        if not publications or any(not item["publication_date"] for item in publications):
-                            raise ValueError("新增申请必须提供公开编号及公开日期")
-                    rows.append({"application_number": number, "fields": fields, "publications": publications,
-                                 "raw_record": raw, "source_sheet": sheet.title, "source_row": row_number})
-                    seen.add(number)
-                except (ValueError, TypeError, KeyError) as exc:
-                    errors.append({"sheet": sheet.title, "row": row_number, "message": str(exc), "raw_record": raw})
-    finally:
-        workbook.close()
-    if not rows and not errors:
-        errors.append({"message": "工作簿中没有补充记录"})
-    return {"rows": rows, "errors": errors, "sheets": sheets}
-
 
 def _json_value(value):
     return value.isoformat() if isinstance(value, (date, datetime)) else copy.deepcopy(value)

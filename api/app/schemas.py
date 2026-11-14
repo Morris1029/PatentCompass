@@ -1,3 +1,5 @@
+from patentcompass_core.contracts import ReportOperation
+
 from datetime import datetime
 from typing import Any, Generic, Literal, TypeVar
 from uuid import UUID
@@ -68,15 +70,6 @@ class RunInput(RequestModel):
     values: dict[str, Any]
 
 
-class ReportOperation(RequestModel):
-    op: Literal["set_title", "replace_text", "insert_block", "remove_block", "move_block", "append_roadmap", "insert_chart", "update_chart", "set_layout", "set_chart_layout"]
-    block_id: str | None = None
-    text: str | None = Field(default=None, max_length=40000)
-    block: dict[str, Any] | None = None
-    after_id: str | None = None
-    chart_id: UUID | None = None
-    chart_version_id: UUID | None = None
-    layout: dict[str, Any] | None = None
 
 
 class ReportRevision(RequestModel):

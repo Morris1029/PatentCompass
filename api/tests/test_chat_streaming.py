@@ -56,8 +56,13 @@ def _mock_sse(monkeypatch, chunks, done=True):
     return requests
 
 
-def _chunk(delta, finish_reason=None):
-    return {"choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}]}
+def _answer(text):
+    return {"type": "message", "id": "msg-test", "role": "assistant", "status": "completed",
+            "content": [{"type": "output_text", "text": text, "annotations": []}]}
+
+
+def _completed(output):
+    return {"type": "response.completed", "response": {"status": "completed", "output": output}}
 
 
 def _send(client, project):
@@ -92,19 +97,27 @@ def test_waiting_confirmation_stream_delivers_pending_events_then_releases_conne
     assert client.get(f"/api/runs/{run.id}/events?after={after}").text == ""
 
 
-def test_adapter_streams_only_public_content_and_reassembles_interleaved_tool_fragments(
+def test_adapter_streams_only_public_content_and_uses_completed_interleaved_tool_calls(
         monkeypatch, configured_chat):
     monkeypatch.setattr(get_settings(), "llm_extra_body", {"temperature": 0.2, "stream": False})
+    read = {"type": "function_call", "id": "fc-read", "call_id": "read-analysis", "status": "completed",
+            "name": "read_analysis", "arguments": '{"view":"overview"}'}
+    search = {"type": "function_call", "id": "fc-search", "call_id": "call-patent", "status": "completed",
+              "name": "search_patents", "arguments": '{"q":"landing"}'}
+    reasoning = {"type": "reasoning", "id": "rs-test", "encrypted_content": "opaque-continuation",
+                 "summary": [{"type": "summary_text", "text": "PRIVATE_REASONING"}]}
     chunks = [
-        _chunk({"role": "assistant", "reasoning_content": "PRIVATE_REASONING"}),
-        _chunk({"content": "你好🧭"}),
-        _chunk({"tool_calls": [
-            {"index": 1, "id": "call-", "function": {"name": "search_", "arguments": '{"q":"'}},
-            {"index": 0, "id": "read-", "function": {"name": "read_", "arguments": '{"view":"over'}}]}),
-        _chunk({"content": "\n**结果**", "reasoning_content": "MORE_PRIVATE_REASONING"}),
-        _chunk({"tool_calls": [
-            {"index": 0, "id": "analysis", "function": {"name": "analysis", "arguments": 'view"}'}},
-            {"index": 1, "id": "patent", "function": {"name": "patents", "arguments": 'landing"}'}}]}, "tool_calls"),
+        {"type": "response.reasoning_summary_text.delta", "delta": "PRIVATE_REASONING"},
+        {"type": "response.output_text.delta", "delta": "你好🧭"},
+        {"type": "response.output_item.added", "output_index": 2, "item": {**search, "arguments": "", "status": "in_progress"}},
+        {"type": "response.output_item.added", "output_index": 1, "item": {**read, "arguments": "", "status": "in_progress"}},
+        {"type": "response.function_call_arguments.delta", "item_id": "fc-search", "output_index": 2, "delta": '{"q":"'},
+        {"type": "response.function_call_arguments.delta", "item_id": "fc-read", "output_index": 1, "delta": '{"view":"over'},
+        {"type": "response.output_text.delta", "delta": "\n**结果**"},
+        {"type": "response.reasoning_summary_text.delta", "delta": "MORE_PRIVATE_REASONING"},
+        {"type": "response.function_call_arguments.delta", "item_id": "fc-read", "output_index": 1, "delta": 'view"}'},
+        {"type": "response.function_call_arguments.delta", "item_id": "fc-search", "output_index": 2, "delta": 'landing"}'},
+        _completed([reasoning, _answer("你好🧭\n**结果**"), read, search]),
     ]
     requests = _mock_sse(monkeypatch, chunks)
     deltas = []
@@ -118,13 +131,16 @@ def test_adapter_streams_only_public_content_and_reassembles_interleaved_tool_fr
         {"id": "call-patent", "type": "function", "function": {"name": "search_patents", "arguments": '{"q":"landing"}'}}]
     assert "PRIVATE_REASONING" not in json.dumps(result)
     assert len(requests) == 1 and requests[0]["method"] == "POST"
-    assert requests[0]["url"] == "https://controlled.invalid/v1/chat/completions"
-    assert requests[0]["json"] == {"temperature": 0.2, "messages": messages, "tools": tools,
-                                    "stream": True, "model": "controlled-model"}
+    assert result["_response_items"][0] == {**reasoning, "summary": []}
+    assert requests[0]["url"] == "https://controlled.invalid/v1/responses"
+    assert requests[0]["json"] == {"temperature": 0.2, "input": messages,
+                                    "tools": [{"type": "function", "name": "search_patents", "strict": False}],
+                                    "stream": True, "store": False, "include": ["reasoning.encrypted_content"],
+                                    "model": "controlled-model"}
 
 
 def test_adapter_rejects_unfinished_stream_after_exposing_received_content(monkeypatch, configured_chat):
-    _mock_sse(monkeypatch, [_chunk({"content": "尚未完成"})], done=False)
+    _mock_sse(monkeypatch, [{"type": "response.output_text.delta", "delta": "尚未完成"}], done=False)
     deltas = []
     with pytest.raises(AppError) as failure:
         model_provider.stream_chat([{"role": "user", "content": "说明范围"}], on_delta=deltas.append)
@@ -212,10 +228,11 @@ def test_tool_round_resets_transitional_draft_before_confirmation_and_keeps_fina
 def test_reasoning_never_reaches_stream_snapshots_saved_answers_or_public_run_events(
         db_session, project, monkeypatch, client, configured_chat):
     _mock_sse(monkeypatch, [
-        _chunk({"reasoning_content": "PRIVATE_CHAIN_OF_THOUGHT"}),
-        _chunk({"content": "公开回答"}),
-        _chunk({"reasoning_content": "ANOTHER_PRIVATE_THOUGHT"}),
-        _chunk({}, "stop")])
+        {"type": "response.reasoning_summary_text.delta", "delta": "PRIVATE_CHAIN_OF_THOUGHT"},
+        {"type": "response.output_text.delta", "delta": "公开回答"},
+        {"type": "response.reasoning_summary_text.delta", "delta": "ANOTHER_PRIVATE_THOUGHT"},
+        _completed([{"type": "reasoning", "id": "rs-private", "encrypted_content": "opaque-continuation",
+                     "summary": [{"type": "summary_text", "text": "PRIVATE_CHAIN_OF_THOUGHT"}]}, _answer("公开回答")])])
     sent = _send(client, project)
     jobs.execute_run(sent["run_id"])
     completed = _status(client, sent["run_id"])

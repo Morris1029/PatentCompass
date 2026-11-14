@@ -1,4 +1,5 @@
 import hashlib
+import json
 from pathlib import Path
 
 import httpx
@@ -114,7 +115,7 @@ def test_provider_embedding_order_and_message(monkeypatch):
             assert json["input"] == ["first", "second"]
             result = {"data": [{"index": 1, "embedding": [0, 1]}, {"index": 0, "embedding": [1, 0]}]}
         else:
-            result = {"choices": [{"message": {"role": "assistant", "content": "response"}}]}
+            result = {"status": "completed", "output": [{"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "response"}]}]}
         return httpx.Response(200, request=httpx.Request("POST", url), json=result)
 
     monkeypatch.setattr(model_provider.httpx, "post", post)
@@ -124,7 +125,10 @@ def test_provider_embedding_order_and_message(monkeypatch):
 
 @pytest.mark.parametrize("vectors", [[{"index": 0, "embedding": [0, 0]}], [{"index": 0, "embedding": [float("inf"), 1]}], []])
 def test_invalid_provider_vectors_are_rejected(monkeypatch, vectors):
-    monkeypatch.setattr(model_provider, "_post", lambda *args: {"data": vectors})
+    settings = Settings(_env_file=None, embedding_base_url="https://models.invalid/v1", embedding_api_key="test", embedding_model="test")
+    monkeypatch.setattr(model_provider, "get_settings", lambda: settings)
+    monkeypatch.setattr(model_provider.httpx, "post", lambda url, **kwargs: httpx.Response(
+        200, request=httpx.Request("POST", url), text=json.dumps({"data": vectors})))
     with pytest.raises(AppError) as error:
         model_provider.embed(["source"])
     assert error.value.code == "MODEL_RESPONSE_INVALID"
